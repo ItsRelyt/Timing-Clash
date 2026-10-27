@@ -23,7 +23,10 @@ HOW TO PLAY
   heals a heart.
 
 F11 = fullscreen   M = mute   P / ESC = pause
+
+Also runs in the browser via Pyodide (see index.html for the GitHub Pages launcher).
 """
+import asyncio
 import colorsys
 import json
 import math
@@ -48,6 +51,7 @@ GROUND = 150               # y where characters' feet rest
 BAR_TOP, BAR_H = 30, 100   # timing bar geometry
 RATE = 22050               # audio sample rate
 SAVE_NAME = "timing_clash_save.json"
+WEB = sys.platform == "emscripten"   # running inside Pyodide / a browser
 
 # DawnBringer 16 palette: every colour in the game comes from here
 PAL = [
@@ -79,6 +83,8 @@ class SaveData:
         here = os.path.dirname(os.path.abspath(__file__))
         self.paths = [os.path.join(here, SAVE_NAME),
                       os.path.join(os.path.expanduser("~"), "." + SAVE_NAME)]
+        if WEB:
+            self.paths = ["/persist/" + SAVE_NAME]
         self.highest = 1
         self.stars = {}
         self.survival_best = 0
@@ -831,6 +837,7 @@ class Audio:
         self.music_snd = None
         self.music_chan = None
         self.muted = False
+        self._gen = None
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init(RATE, -16, 1, 512)
@@ -849,7 +856,11 @@ class Audio:
                 snd = self._to_sound(samples)
                 snd.set_volume(0.55)
                 self.sounds[name] = snd
-            threading.Thread(target=self._build_music, daemon=True).start()
+            self._gen = self._music_steps()
+            if not WEB:     # desktop: build in a background thread
+                gen = self._gen
+                self._gen = None
+                threading.Thread(target=lambda: [None for _ in gen], daemon=True).start()
         except Exception:
             self.ok = False
 
@@ -863,7 +874,7 @@ class Audio:
                 buf.append(iv)
         return pygame.mixer.Sound(buffer=buf.tobytes())
 
-    def _build_music(self):
+    def _music_steps(self):
         try:
             bpm = 138
             eighth = 60.0 / bpm / 2
@@ -894,6 +905,7 @@ class Audio:
                         mix(pos, render_note(0, 0.03, "noise", 0.05, 0, 2.0))
                     if e in (0, 4):
                         mix(pos, render_note(120, 0.08, "sq", 0.12, -70, 2.0))
+                    yield
             snd = self._to_sound(total)
             snd.set_volume(0.32)
             self.music_snd = snd
@@ -901,6 +913,16 @@ class Audio:
                 self._start_music()
         except Exception:
             pass
+
+    def pump(self):
+        """Browser only: advance music synthesis a little each frame."""
+        if self._gen is not None:
+            try:
+                next(self._gen)
+            except StopIteration:
+                self._gen = None
+            except Exception:
+                self._gen = None
 
     def _start_music(self):
         if self.music_snd is not None and self.music_chan is None:
@@ -1302,6 +1324,8 @@ class TitleScene(Scene):
 
     def __init__(self, app):
         super().__init__(app)
+        if WEB:
+            self.ITEMS = self.ITEMS[:-1]      # nothing to quit to in a browser tab
         self.sel = 0
         self.t = 0.0
         self.theme = random.randrange(5)
@@ -1342,10 +1366,10 @@ class TitleScene(Scene):
             self.app.audio.play("select")
         elif e.key in (pygame.K_RETURN, pygame.K_SPACE):
             self.activate(self.sel)
-        elif pygame.K_1 <= e.key <= pygame.K_6:
+        elif pygame.K_1 <= e.key <= pygame.K_6 and e.key - pygame.K_1 < n:
             self.sel = e.key - pygame.K_1
             self.activate(self.sel)
-        elif e.key == pygame.K_ESCAPE:
+        elif e.key == pygame.K_ESCAPE and not WEB:
             self.app.running = False
 
     def draw(self, s):
@@ -1543,6 +1567,7 @@ class SettingsScene(Scene):
 
     def __init__(self, app):
         super().__init__(app)
+        self.items = [it for it in self.ITEMS if not (WEB and it[0] == "fullscreen")]
         self.sel = 0
         self.confirm = False
         self.t = 0.0
@@ -1553,7 +1578,7 @@ class SettingsScene(Scene):
         self.t += dt
 
     def change(self, d):
-        key, _label, values, _fmt, _desc = self.ITEMS[self.sel]
+        key, _label, values, _fmt, _desc = self.items[self.sel]
         a = self.app
         if key == "reset":
             if d > 0 or d == 0:
@@ -1578,7 +1603,7 @@ class SettingsScene(Scene):
     def handle(self, e):
         if e.type != pygame.KEYDOWN:
             return
-        n = len(self.ITEMS)
+        n = len(self.items)
         if e.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
             self.app.audio.play("back")
             self.app.pop()
@@ -1599,7 +1624,7 @@ class SettingsScene(Scene):
         s.blit(get_bg(1), (0, 0))
         s.blit(self.shade, (0, 0))
         draw_text(s, "SETTINGS", W // 2, 6, YELLOW, 2, "center")
-        for i, (key, label, _values, fmt, _desc) in enumerate(self.ITEMS):
+        for i, (key, label, _values, fmt, _desc) in enumerate(self.items):
             y = 28 + i * 14
             sel = i == self.sel
             if sel:
@@ -1614,7 +1639,7 @@ class SettingsScene(Scene):
                 txt = fmt(v) if fmt else ("ON" if v else "OFF")
                 col = (GREEN if v else RED) if fmt is None else CYAN
             draw_text(s, f"< {txt} >" if sel and key != "reset" else txt, 280, y, col, 1, "right")
-        draw_text(s, self.ITEMS[self.sel][4], W // 2, 156, STEEL, 1, "center")
+        draw_text(s, self.items[self.sel][4], W // 2, 156, STEEL, 1, "center")
         draw_text(s, "UP/DOWN: SELECT  LEFT/RIGHT: CHANGE  ESC: BACK", W // 2, 171, STEEL, 1, "center")
 
 
@@ -2237,6 +2262,7 @@ class App:
         self.audio = Audio(self)
         self.scenes = []
         self.running = True
+        self.blur_event = getattr(pygame, "WINDOWFOCUSLOST", None)
         self.shake_t = self.shake_mag = 0.0
         self.flash = None
         self.flash_surf = pygame.Surface((W, H), pygame.SRCALPHA)
@@ -2253,6 +2279,12 @@ class App:
 
     # ---- window / effects ------------------------------------------------
     def set_fullscreen(self, on):
+        if WEB:    # the page handles fullscreen; the canvas is a fixed 4x surface
+            self.fullscreen = False
+            self.cfg["fullscreen"] = False
+            if getattr(self, "win", None) is None:
+                self.win = pygame.display.set_mode((W * 4, H * 4))
+            return
         self.fullscreen = bool(on)
         self.cfg["fullscreen"] = self.fullscreen
         try:
@@ -2294,53 +2326,96 @@ class App:
         pygame.display.flip()
 
     # ---- main loop -------------------------------------------------------
-    def run(self):
-        blur_event = getattr(pygame, "WINDOWFOCUSLOST", None)
-        while self.running and self.scenes:
-            dt = min(self.clock.tick(FPS) / 1000.0, 1 / 30)
-            for e in pygame.event.get():
-                if e.type == pygame.QUIT:
-                    self.running = False
-                elif e.type == pygame.KEYDOWN and e.key == pygame.K_F11:
+    def frame(self):
+        """Run one iteration of the game loop.  Returns False when the game is over."""
+        dt = min(self.clock.tick(0 if WEB else FPS) / 1000.0, 1 / 30)
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                self.running = False
+            elif e.type == pygame.KEYDOWN and e.key == pygame.K_F11:
+                if not WEB:
                     self.set_fullscreen(not self.fullscreen)
                     self.save.save()
-                elif e.type == pygame.KEYDOWN and e.key == pygame.K_m:
-                    self.audio.toggle_mute()
-                elif blur_event is not None and e.type == blur_event:
-                    if self.scenes:
-                        self.scenes[-1].on_blur()
-                elif self.scenes:
-                    self.scenes[-1].handle(e)
-            if not self.scenes:
-                break
-            self.scenes[-1].update(dt)
-            if self.shake_t > 0:
-                self.shake_t -= dt
-                if self.shake_t <= 0:
-                    self.shake_mag = 0.0
-            # draw: from the last non-overlay scene up to the top
-            base = len(self.scenes) - 1
-            while base > 0 and self.scenes[base].overlay:
-                base -= 1
-            for sc in self.scenes[base:]:
-                sc.draw(self.canvas)
-            if self.flash:
-                self.flash[3] -= dt
-                if self.flash[3] <= 0:
-                    self.flash = None
-                else:
-                    a = int(self.flash[1] * self.flash[3] / self.flash[2])
-                    self.flash_surf.fill(self.flash[0] + (a,))
-                    self.canvas.blit(self.flash_surf, (0, 0))
-            if self.cfg["show_fps"]:
-                draw_text(self.canvas, f"FPS {int(self.clock.get_fps())}", W - 4, H - 10, GREEN, 1, "right")
-            self.present()
+            elif e.type == pygame.KEYDOWN and e.key == pygame.K_m:
+                self.audio.toggle_mute()
+            elif self.blur_event is not None and e.type == self.blur_event:
+                if self.scenes:
+                    self.scenes[-1].on_blur()
+            elif self.scenes:
+                self.scenes[-1].handle(e)
+        if not self.scenes or not self.running:
+            return False
+        self.audio.pump()
+        self.scenes[-1].update(dt)
+        if self.shake_t > 0:
+            self.shake_t -= dt
+            if self.shake_t <= 0:
+                self.shake_mag = 0.0
+        # draw: from the last non-overlay scene up to the top
+        base = len(self.scenes) - 1
+        while base > 0 and self.scenes[base].overlay:
+            base -= 1
+        for sc in self.scenes[base:]:
+            sc.draw(self.canvas)
+        if self.flash:
+            self.flash[3] -= dt
+            if self.flash[3] <= 0:
+                self.flash = None
+            else:
+                a = int(self.flash[1] * self.flash[3] / self.flash[2])
+                self.flash_surf.fill(self.flash[0] + (a,))
+                self.canvas.blit(self.flash_surf, (0, 0))
+        if self.cfg["show_fps"]:
+            draw_text(self.canvas, f"FPS {int(self.clock.get_fps())}", W - 4, H - 10, GREEN, 1, "right")
+        self.present()
+        return True
+
+    def shutdown(self):
         self.save.save()
         pygame.quit()
 
+    def run(self):
+        """Desktop: classic blocking loop."""
+        while self.frame():
+            pass
+        self.shutdown()
+
+    async def run_async(self):
+        """Browser: yield to the page every frame (paced by requestAnimationFrame)."""
+        while self.frame():
+            await _next_web_frame()
+        self.shutdown()
+
+
+async def _next_web_frame():
+    try:
+        import js
+        from pyodide.ffi import create_once_callable
+        fut = asyncio.get_running_loop().create_future()
+
+        def _cb(_ts):
+            if not fut.done():
+                fut.set_result(None)
+        js.requestAnimationFrame(create_once_callable(_cb))
+        await fut
+    except ImportError:
+        await asyncio.sleep(0.016)
+
+
+async def main_async():
+    try:
+        await App().run_async()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
 
 def main():
-    App().run()
+    if WEB:
+        # Pyodide: schedule on the page's event loop and return immediately
+        asyncio.ensure_future(main_async())
+    else:
+        App().run()
 
 
 if __name__ == "__main__":
