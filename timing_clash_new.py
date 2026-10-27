@@ -1,1614 +1,2346 @@
 #!/usr/bin/env python3
 """
-TIMING CLASH  -  a self-contained pixel-arcade timing game.
+TIMING CLASH  -  a pixel-art timing battler
+===========================================
 
-Everything the game needs lives in THIS single .py file:
-  * All graphics are generated procedurally as crisp pixel art (no image files)
-  * All sound effects are synthesized on the fly (no audio files)
-  * Save data is optional and stored next to this script
+Single file, no assets.  Every sprite, font, background and sound is generated
+in code.  The only dependency is pygame:
 
-HOW TO PLAY
-  A laser cursor sweeps up and down the tower. Slam your key at exactly
-  the right moment to land inside the glowing TARGET zone. Perfect center
-  hits score DOUBLE. Chain hits for a streak multiplier, charge your
-  COMBO meter and unleash FEVER MODE for massive points!
+    pip install pygame
+    python timing_clash.py
 
 MODES
-  [1] Career      - 25 hand-balanced procedural levels, stars & high scores
-  [2] Tug-of-War  - local 2-player battle (P1 = A, P2 = L), best-of-3 option
+  CAMPAIGN   Fight through endless levels.  Every 5th level is a boss, every
+             5 levels is a new world.  Earn up to 3 stars per level.
+  SURVIVAL   One heart pool, endless waves.  Chase your best wave and score.
+  VERSUS 2P  Local duel on one keyboard.  P1 = A, P2 = L.  Best of 1 / 3 / 5.
 
-Run:  python timing_clash.py     (requires: pip install pygame)
+HOW TO PLAY
+  A line bounces up and down a bar.  Hit SPACE (or A, or click) while it is
+  inside the green zone.  The gold centre is a PERFECT hit (double damage).
+  Miss and the bar locks while the enemy's RAGE meter charges.  When the
+  meter fills, it hits you.  Every 5-hit streak is a POWER STRIKE that also
+  heals a heart.
+
+F11 = fullscreen   M = mute   P / ESC = pause
 """
-
+import colorsys
 import json
 import math
 import os
 import random
 import sys
-import tempfile
+import threading
+from array import array
 
 try:
     import pygame
 except ImportError:  # pragma: no cover
-    print("This game needs pygame.  Install it with:  pip install pygame")
-    sys.exit(1)
+    sys.exit("Timing Clash needs pygame.\nInstall it with:  pip install pygame")
 
-# ======================================================================
-# DISPLAY / CORE CONSTANTS
-# ======================================================================
-WIDTH, HEIGHT = 1000, 600
+# --------------------------------------------------------------------------
+#  CONSTANTS
+# --------------------------------------------------------------------------
+W, H = 320, 180            # internal pixel resolution (scaled up to the window)
 FPS = 60
+FLOOR_Y = 132              # top of the ground
+GROUND = 150               # y where characters' feet rest
+BAR_TOP, BAR_H = 30, 100   # timing bar geometry
+RATE = 22050               # audio sample rate
+SAVE_NAME = "timing_clash_save.json"
 
-# Internal low-res buffer -> chunky pixels when scaled up 2x
-PX_W, PX_H = WIDTH // 2, HEIGHT // 2
-PIXEL_SCALE = 2
+# DawnBringer 16 palette: every colour in the game comes from here
+PAL = [
+    (20, 12, 28), (68, 36, 52), (48, 52, 109), (78, 74, 78),
+    (133, 76, 48), (52, 101, 36), (208, 70, 72), (117, 113, 97),
+    (89, 125, 206), (210, 125, 44), (133, 149, 161), (109, 170, 44),
+    (210, 170, 153), (109, 194, 202), (218, 212, 94), (222, 238, 214),
+]
+(INK, WINE, NAVY, CHAR, BROWN, FOREST, RED, STONE,
+ BLUE, ORANGE, STEEL, GREEN, SKIN, CYAN, YELLOW, WHITE) = PAL
 
-# Retro palette
-C_BG_TOP      = (18, 14, 46)
-C_BG_BOT      = (44, 22, 74)
-C_HORIZON     = (96, 48, 140)
-C_STAR        = (220, 220, 255)
-C_P1          = (90, 200, 255)
-C_P1_DARK     = (30, 90, 160)
-C_P2          = (255, 110, 90)
-C_P2_DARK     = (160, 40, 40)
-C_GREEN       = (90, 240, 120)
-C_GOLD        = (255, 210, 80)
-C_WHITE       = (240, 240, 245)
-C_DIM         = (140, 140, 170)
-C_VERY_DIM    = (55, 55, 80)
-C_RED         = (255, 80, 80)
-C_FEVER_A     = (255, 90, 160)
-C_FEVER_B     = (255, 170, 60)
-
-BAR_W, BAR_H = 25, 200          # in PIXEL units (doubled on screen)
-BAR_Y = 60                      # top of bars, pixel units
-
-SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "timing_clash_save.json")
-
-# ======================================================================
-# PYGAME INIT + FONTS (built-in font, zero external files)
-# ======================================================================
-pygame.init()
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-buffer = pygame.Surface((PX_W, PX_H))          # low-res pixel canvas
-pygame.display.set_caption("Timing Clash")
-clock = pygame.time.Clock()
-
-font_giant  = pygame.font.Font(None, 150)
-font_large  = pygame.font.Font(None, 60)
-font_medium = pygame.font.Font(None, 30)
-font_small  = pygame.font.Font(None, 22)
-font_tiny   = pygame.font.Font(None, 16)
-
-
-def draw_text(surf, text, font, color, x, y, center=True):
-    img = font.render(text, True, color)
-    rect = img.get_rect()
-    if center:
-        rect.center = (x, y)
-    else:
-        rect.topleft = (x, y)
-    surf.blit(img, rect)
-
-
-def draw_text_shadow(surf, text, font, color, x, y, center=True,
-                     shadow=(0, 0, 0)):
-    draw_text(surf, text, font, shadow, x + 2, y + 2, center)
-    draw_text(surf, text, font, color, x, y, center)
-
-
-# ======================================================================
-# SAVE SYSTEM (atomic, never crashes)
-# ======================================================================
-def load_save():
-    try:
-        with open(SAVE_FILE, "r") as f:
-            data = json.load(f)
-        return {
-            "highest_unlocked_level": max(1, int(data.get("highest_unlocked_level", 1))),
-            "stars": int(data.get("stars", 0)),
-            "highscores": dict(data.get("highscores", {})),
-            "level_stars": dict(data.get("level_stars", {})),
-        }
-    except Exception:
-        return {"highest_unlocked_level": 1, "stars": 0,
-                "highscores": {}, "level_stars": {}}
-
-
-def write_save(data):
-    try:
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(SAVE_FILE) or ".",
-                                   suffix=".tmp")
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, SAVE_FILE)
-    except Exception:
-        pass
-
-
-# ======================================================================
-# SETTINGS (defined before SoundEngine so sound.play() can consult them)
-# ======================================================================
-SETTINGS = {
-    "screen_shake": True,
-    "particles": True,
-    "show_fps": False,
-    "hardcore_penalties": False,
-    "sound": True,
+DEFAULT_SETTINGS = {
+    "difficulty": 1, "music": True, "sfx": True, "shake": True,
+    "particles": True, "show_fps": False, "vs_rounds": 3, "fullscreen": False,
 }
-SETTING_KEYS = list(SETTINGS.keys())
-SETTING_LABELS = {
-    "screen_shake": "Screen Shake FX",
-    "particles": "Particle Effects",
-    "show_fps": "FPS Counter",
-    "hardcore_penalties": "Hardcore Penalties (2s Freeze)",
-    "sound": "Sound Effects",
-}
+DIFFICULTY = [
+    {"name": "EASY", "hearts": 6, "lock": 0.45, "gauge": 1.45},
+    {"name": "NORMAL", "hearts": 5, "lock": 0.80, "gauge": 1.00},
+    {"name": "HARD", "hearts": 4, "lock": 1.30, "gauge": 0.72},
+]
+WORLD_NAMES = ["GREEN MEADOW", "DARK CAVE", "OLD CASTLE", "FIRE PEAK", "THE VOID"]
 
-# ======================================================================
-# SOUND ENGINE - tiny synth, all waveforms generated in memory
-# ======================================================================
-class SoundEngine:
+
+# --------------------------------------------------------------------------
+#  SAVE DATA  (compatible with the old save: "highest_unlocked_level")
+# --------------------------------------------------------------------------
+class SaveData:
     def __init__(self):
-        self.enabled = False
-        self.mixer_ok = False
-        try:
-            pygame.mixer.pre_init(22050, -16, 1, 256)
-            pygame.mixer.init(22050, -16, 1, 256)
-            self.mixer_ok = True
-        except Exception:
-            self.mixer_ok = False
-        self.sounds = {}
-        if self.mixer_ok:
-            self._build()
+        here = os.path.dirname(os.path.abspath(__file__))
+        self.paths = [os.path.join(here, SAVE_NAME),
+                      os.path.join(os.path.expanduser("~"), "." + SAVE_NAME)]
+        self.highest = 1
+        self.stars = {}
+        self.survival_best = 0
+        self.survival_wave = 0
+        self.settings = dict(DEFAULT_SETTINGS)
+        self.load()
 
-    @staticmethod
-    def _to_sound(samples):
-        buf = bytearray(2 * len(samples))
-        for i, s in enumerate(samples):
-            v = int(max(-1.0, min(1.0, s)) * 30000)
-            buf[2 * i] = v & 0xFF
-            buf[2 * i + 1] = (v >> 8) & 0xFF
-        return pygame.mixer.Sound(buffer=bytes(buf))
-
-    def _tone(self, freq, dur, vol=0.5, decay=6.0, slide=0.0, wave="sine"):
-        rate = 22050
-        n = int(rate * dur)
-        out = []
-        phase = 0.0
-        for i in range(n):
-            f = freq + slide * (i / n)
-            phase += f / rate
-            t = phase * 2 * math.pi
-            if wave == "sine":
-                s = math.sin(t)
-            elif wave == "square":
-                s = 1.0 if math.sin(t) >= 0 else -1.0
-            elif wave == "triangle":
-                s = 2 * abs(2 * (phase % 1) - 1) - 1
-            else:  # noise
-                s = random.uniform(-1, 1)
-            env = math.exp(-decay * (i / n)) * (1 if i > rate * 0.002 else i / (rate * 0.002))
-            out.append(s * env * vol)
-        return self._to_sound(out)
-
-    def _chord(self, freqs, dur, vol=0.35, decay=4.0, wave="square"):
-        rate = 22050
-        n = int(rate * dur)
-        out = []
-        for i in range(n):
-            s = sum(math.sin(2 * math.pi * f * i / rate) for f in freqs) / len(freqs)
-            env = math.exp(-decay * (i / n))
-            if wave == "square":
-                s = 1.0 if s >= 0 else -1.0
-            out.append(s * env * vol)
-        return self._to_sound(out)
-
-    def _noise(self, dur, vol=0.4, decay=8.0):
-        rate = 22050
-        n = int(rate * dur)
-        out = [random.uniform(-1, 1) * math.exp(-decay * (i / n)) * vol for i in range(n)]
-        return self._to_sound(out)
-
-    def _build(self):
-        try:
-            self.sounds["hit"] = self._tone(660, 0.09, 0.45, 9, 220, "square")
-            self.sounds["perfect"] = self._chord([880, 1320], 0.16, 0.4, 5)
-            self.sounds["miss"] = self._tone(180, 0.22, 0.5, 7, -80, "square")
-            self.sounds["fever"] = self._chord([523, 659, 784, 1046], 0.4, 0.4, 3)
-            self.sounds["select"] = self._tone(520, 0.06, 0.35, 12, 120, "square")
-            self.sounds["back"] = self._tone(300, 0.08, 0.35, 12, -60, "square")
-            self.sounds["win"] = self._chord([523, 659, 784], 0.55, 0.4, 2.5)
-            self.sounds["lose"] = self._tone(300, 0.5, 0.4, 4, -180, "triangle")
-            self.sounds["coin"] = self._chord([988, 1319], 0.12, 0.3, 8)
-            self.sounds["crash"] = self._noise(0.3, 0.5, 7)
-            self.enabled = True
-        except Exception:
-            self.enabled = False
-
-    def play(self, name):
-        if self.enabled and SETTINGS.get("sound", True) and name in self.sounds:
+    def load(self):
+        for p in self.paths:
+            if not os.path.exists(p):
+                continue
             try:
-                self.sounds[name].play()
+                with open(p, "r") as f:
+                    d = json.load(f)
+                self.highest = max(1, int(d.get("highest_unlocked_level", 1)))
+                self.stars = {str(k): int(v) for k, v in d.get("stars", {}).items()}
+                self.survival_best = int(d.get("survival_best", 0))
+                self.survival_wave = int(d.get("survival_wave", 0))
+                for k, v in d.get("settings", {}).items():
+                    if k in DEFAULT_SETTINGS and type(v) is type(DEFAULT_SETTINGS[k]):
+                        self.settings[k] = v
+                return
             except Exception:
-                pass
+                continue
+
+    def save(self):
+        payload = {
+            "highest_unlocked_level": self.highest, "stars": self.stars,
+            "survival_best": self.survival_best, "survival_wave": self.survival_wave,
+            "settings": self.settings,
+        }
+        for p in self.paths:
+            try:
+                with open(p, "w") as f:
+                    json.dump(payload, f, indent=1)
+                return
+            except OSError:
+                continue
+
+    def star_count(self, level):
+        return self.stars.get(str(level), 0)
+
+    def record_level(self, level, stars):
+        self.highest = max(self.highest, level + 1)
+        if stars > self.star_count(level):
+            self.stars[str(level)] = stars
+        self.save()
+
+    def reset(self):
+        self.highest, self.stars = 1, {}
+        self.survival_best = self.survival_wave = 0
+        self.save()
 
 
-sound = SoundEngine()
+# --------------------------------------------------------------------------
+#  PIXEL FONT  (5x7 bitmap, uppercase only)
+# --------------------------------------------------------------------------
+_FONT_SRC = {
+    "A": ".###. #...# #...# ##### #...# #...# #...#",
+    "B": "####. #...# #...# ####. #...# #...# ####.",
+    "C": ".###. #...# #.... #.... #.... #...# .###.",
+    "D": "####. #...# #...# #...# #...# #...# ####.",
+    "E": "##### #.... #.... ####. #.... #.... #####",
+    "F": "##### #.... #.... ####. #.... #.... #....",
+    "G": ".###. #...# #.... #.### #...# #...# .###.",
+    "H": "#...# #...# #...# ##### #...# #...# #...#",
+    "I": ".###. ..#.. ..#.. ..#.. ..#.. ..#.. .###.",
+    "J": "..### ...#. ...#. ...#. ...#. #..#. .##..",
+    "K": "#...# #..#. #.#.. ##... #.#.. #..#. #...#",
+    "L": "#.... #.... #.... #.... #.... #.... #####",
+    "M": "#...# ##.## #.#.# #.#.# #...# #...# #...#",
+    "N": "#...# ##..# #.#.# #..## #...# #...# #...#",
+    "O": ".###. #...# #...# #...# #...# #...# .###.",
+    "P": "####. #...# #...# ####. #.... #.... #....",
+    "Q": ".###. #...# #...# #...# #.#.# #..#. .##.#",
+    "R": "####. #...# #...# ####. #.#.. #..#. #...#",
+    "S": ".#### #.... #.... .###. ....# ....# ####.",
+    "T": "##### ..#.. ..#.. ..#.. ..#.. ..#.. ..#..",
+    "U": "#...# #...# #...# #...# #...# #...# .###.",
+    "V": "#...# #...# #...# #...# #...# .#.#. ..#..",
+    "W": "#...# #...# #...# #.#.# #.#.# ##.## #...#",
+    "X": "#...# #...# .#.#. ..#.. .#.#. #...# #...#",
+    "Y": "#...# #...# .#.#. ..#.. ..#.. ..#.. ..#..",
+    "Z": "##### ....# ...#. ..#.. .#... #.... #####",
+    "0": ".###. #...# #..## #.#.# ##..# #...# .###.",
+    "1": "..#.. .##.. ..#.. ..#.. ..#.. ..#.. .###.",
+    "2": ".###. #...# ....# ...#. ..#.. .#... #####",
+    "3": ".###. #...# ....# ..##. ....# #...# .###.",
+    "4": "...#. ..##. .#.#. #..#. ##### ...#. ...#.",
+    "5": "##### #.... ####. ....# ....# #...# .###.",
+    "6": "..##. .#... #.... ####. #...# #...# .###.",
+    "7": "##### ....# ...#. ..#.. .#... .#... .#...",
+    "8": ".###. #...# #...# .###. #...# #...# .###.",
+    "9": ".###. #...# #...# .#### ....# ...#. .##..",
+    ".": "..... ..... ..... ..... ..... .##.. .##..",
+    ",": "..... ..... ..... ..... .##.. ..#.. .#...",
+    "!": "..#.. ..#.. ..#.. ..#.. ..#.. ..... ..#..",
+    "?": ".###. #...# ....# ...#. ..#.. ..... ..#..",
+    ":": "..... .##.. .##.. ..... .##.. .##.. .....",
+    "-": "..... ..... ..... .###. ..... ..... .....",
+    "+": "..... ..#.. ..#.. ##### ..#.. ..#.. .....",
+    "/": "....# ....# ...#. ..#.. .#... #.... #....",
+    "(": "..#.. .#... #.... #.... #.... .#... ..#..",
+    ")": "..#.. ...#. ....# ....# ....# ...#. ..#..",
+    "'": "..#.. ..#.. .#... ..... ..... ..... .....",
+    "%": "##..# ##..# ...#. ..#.. .#... #..## #..##",
+    "*": "..... #.#.# .###. ##### .###. #.#.# .....",
+    "<": "...#. ..#.. .#... #.... .#... ..#.. ...#.",
+    ">": ".#... ..#.. ...#. ....# ...#. ..#.. .#...",
+    "=": "..... ..... ##### ..... ##### ..... .....",
+    "[": "###.. #.... #.... #.... #.... #.... ###..",
+    "]": "..### ....# ....# ....# ....# ....# ..###",
+    " ": ".....  .....  .....  .....  .....  .....  .....",
+}
+FONT = {ch: src.split() for ch, src in _FONT_SRC.items()}
+FONT[" "] = ["....."] * 7
 
-# ======================================================================
-# PIXEL ART SPRITES - defined as ASCII grids, rendered once at startup
-# ======================================================================
-def render_sprite(rows, palette, scale=1):
+_text_cache = {}
+
+
+def text_width(text, scale=1):
+    return max(0, len(text) * 6 * scale - scale)
+
+
+def text_surf(text, color, scale=1, shadow=None):
+    key = (text, color, scale, shadow)
+    img = _text_cache.get(key)
+    if img is not None:
+        return img
+    if len(_text_cache) > 700:
+        _text_cache.clear()
+    soff = 0
+    if shadow:
+        soff = scale if scale <= 2 else max(1, scale // 2)
+    w = max(1, text_width(text, scale) + soff)
+    h = 7 * scale + soff
+    img = pygame.Surface((w, h), pygame.SRCALPHA)
+    passes = [(shadow, soff), (color, 0)] if shadow else [(color, 0)]
+    for col, off in passes:
+        for i, ch in enumerate(text.upper()):
+            rows = FONT.get(ch)
+            if not rows:
+                continue
+            for ry, row in enumerate(rows):
+                for rx, c in enumerate(row):
+                    if c == "#":
+                        img.fill(col, (i * 6 * scale + rx * scale + off,
+                                       ry * scale + off, scale, scale))
+    _text_cache[key] = img
+    return img
+
+
+def draw_text(surf, text, x, y, color=WHITE, scale=1, align="left", shadow=INK):
+    img = text_surf(str(text), color, scale, shadow)
+    if align == "center":
+        x -= img.get_width() // 2
+    elif align == "right":
+        x -= img.get_width()
+    surf.blit(img, (int(x), int(y)))
+    return img.get_width()
+
+
+# --------------------------------------------------------------------------
+#  SPRITES  (hex digit = index into the 16-colour palette, '.' = clear)
+# --------------------------------------------------------------------------
+def sym(half):
+    return [r + r[::-1] for r in half]
+
+
+HERO = [
+    "......66......f.",
+    ".....666.....fa.",
+    "....000000...fa.",
+    "...0aafffa0..fa.",
+    "...0aaaaaaa0.fa.",
+    "...0aa00000a0fa.",
+    "...0aaaaaaaa0fa.",
+    "....0aaaaaa0.fa.",
+    "...008888880.fa.",
+    "..0c0e8888820fa.",
+    "..0c08888882eeee",
+    "...0088888882.4.",
+    "....02222220.4..",
+    "....0222222.0...",
+    "....04400440....",
+    "...0440.0440....",
+]
+
+SLIME = [
+    "................",
+    "................",
+    "................",
+    "................",
+    "......0000......",
+    "....00bbbb00....",
+    "...0bbfbbbbb0...",
+    "..0bbfbbbbbbb0..",
+    "..0bbbbbbbbbb0..",
+    ".0bbffbbbbffbb0.",
+    ".0bb0fbbbb0fbb0.",
+    ".0bbbbbbbbbbbb0.",
+    ".0bbbbbbbbbbbb0.",
+    ".05bbbbbbbbbb50.",
+    "..055bbbbbb550..",
+    "...0055555500...",
+]
+
+BAT = sym([
+    "........",
+    "........",
+    "........",
+    "......0.",
+    "0....030",
+    "00..0333",
+    "0100.0e3",
+    "01110333",
+    "011110.3",
+    "0111110.",
+    ".010110.",
+    "..0.0.0.",
+    "........",
+    "........",
+    "........",
+    "........",
+])
+
+GOBLIN = sym([
+    "........",
+    "........",
+    "....0000",
+    "..00bbbb",
+    "00.0bbbb",
+    "0b0bbbbb",
+    "0bb0b6bb",
+    ".0bbbbbb",
+    "..0bb00b",
+    "...0bbbb",
+    "..044444",
+    ".0444444",
+    ".0b44444",
+    "..044.04",
+    "..0440.0",
+    "..000.00",
+])
+
+SKULL = sym([
+    "........",
+    "....0000",
+    "...0ffff",
+    "..0fffff",
+    "..0fffff",
+    "..0f000f",
+    "..0f000f",
+    "..0ffff0",
+    "..00ffff",
+    "...0f0f0",
+    "...00000",
+    "....0aaf",
+    "...0afaa",
+    "...0aaff",
+    "....0aaa",
+    "...00a00",
+])
+
+GHOST = sym([
+    "........",
+    "....0000",
+    "...0ffff",
+    "..0fffff",
+    "..0fffff",
+    "..0ff00f",
+    "..0ff00f",
+    "..0fffff",
+    "..0fff00",
+    "..0dffff",
+    "..0dffff",
+    "..0ddfff",
+    "..0dddff",
+    "..0d0ddf",
+    "...00d0d",
+    "....0.0.",
+])
+
+GOLEM = sym([
+    "........",
+    "........",
+    "....0000",
+    "...07777",
+    "...07ee7",
+    "...07777",
+    "..000777",
+    ".0a07777",
+    "0aa0a777",
+    "0aa0a7a7",
+    "0a00a777",
+    ".0.07777",
+    "...07a7a",
+    "...07777",
+    "...0770.",
+    "..00000.",
+])
+
+ENEMY_ART = {"slime": SLIME, "bat": BAT, "goblin": GOBLIN,
+             "skull": SKULL, "ghost": GHOST, "golem": GOLEM}
+
+HEART = [".66.66.", "6f66666", "6666666", ".66666.", "..666..", "...6..."]
+STAR = ["...e...", "..eee..", "eeeeeee", ".eeeee.", "..eee..", ".ee.ee.", ".e...e."]
+LOCK = ["..aaa..", ".a...a.", ".a...a.", "aaaaaaa", "aa333aa", "aa333aa", "aaaaaaa"]
+SKULL_ICON = [".fffff.", "f0fff0f", "f0fff0f", ".fffff.", "..f.f..", "..fff.."]
+
+_spr_cache = {}
+_sil_cache = {}
+
+
+def shift_hue(c, hue):
+    h, s, v = colorsys.rgb_to_hsv(c[0] / 255, c[1] / 255, c[2] / 255)
+    if s < 0.3:
+        return c
+    r, g, b = colorsys.hsv_to_rgb((h + hue) % 1.0, s, v)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
+def make_sprite(rows, hue=0.0, remap=None):
     h = len(rows)
     w = max(len(r) for r in rows)
-    surf = pygame.Surface((w * scale, h * scale), pygame.SRCALPHA)
+    surf = pygame.Surface((w, h), pygame.SRCALPHA)
     for y, row in enumerate(rows):
         for x, ch in enumerate(row):
-            col = palette.get(ch)
-            if col is not None:
-                pygame.draw.rect(surf, col,
-                                 (x * scale, y * scale, scale, scale))
+            if ch == ".":
+                continue
+            if remap and ch in remap:
+                ch = remap[ch]
+            c = PAL[int(ch, 16)]
+            if hue:
+                c = shift_hue(c, hue)
+            surf.set_at((x, y), c)
     return surf
 
 
-PAL_ROCKET = {
-    ".": None,
-    "R": (235, 235, 245),   # hull
-    "r": (170, 175, 200),   # hull shade
-    "O": (255, 90, 90),     # nose / fins
-    "o": (190, 50, 50),      # fin shade
-    "C": (120, 220, 255),    # cockpit glass
-    "c": (60, 140, 210),     # glass shade
-    "F": (255, 200, 60),     # flame outer
-    "f": (255, 110, 40),     # flame inner
-}
-
-ROCKET_ROWS = [
-    "....OOO....",
-    "...ORRO...",
-    "..ORRRRO..",
-    ".oRRCCRRo.",
-    ".oRcCCcRo.",
-    ".oRRRRRRo.",
-    "oRRRrrRRRo",
-    "ORRrrrrRRO",
-    "ORrrrrrrRO",
-    ".orrrrrro.",
-    "..oFOFOf..",
-    "...Ffff...",
-    "....ff....",
-]
-
-ROCKET_FLAME_ROWS = [
-    "....OOO....",
-    "...ORRO...",
-    "..ORRRRO..",
-    ".oRRCCRRo.",
-    ".oRcCCcRo.",
-    ".oRRRRRRo.",
-    "oRRRrrRRRo",
-    "ORRrrrrRRO",
-    "ORrrrrrrRO",
-    ".orrrrrro.",
-    "..oFOFOFo.",
-    ".oFFFFFFo.",
-    "..fFFFFf..",
-    "...ffff...",
-    "....ff....",
-]
-
-rocket_idle = render_sprite(ROCKET_ROWS, PAL_ROCKET)
-rocket_flame = render_sprite(ROCKET_FLAME_ROWS, PAL_ROCKET)
+def silhouette(surf, color):
+    key = (id(surf), color)
+    s = _sil_cache.get(key)
+    if s is None:
+        mask = pygame.mask.from_surface(surf)
+        s = mask.to_surface(setcolor=color + (255,), unsetcolor=(0, 0, 0, 0))
+        _sil_cache[key] = s
+    return s
 
 
-def recolor_rocket(rows, color):
-    pal = dict(PAL_ROCKET)
-    pal["O"] = color
-    pal["o"] = tuple(max(0, c - 70) for c in color)
-    return render_sprite(rows, pal)
+def outlined(surf, color=INK):
+    w, h = surf.get_size()
+    out = pygame.Surface((w + 2, h + 2), pygame.SRCALPHA)
+    sil = silhouette(surf, color)
+    for dx, dy in ((0, 1), (2, 1), (1, 0), (1, 2)):
+        out.blit(sil, (dx, dy))
+    out.blit(surf, (1, 1))
+    return out
 
 
-rocket_p2_idle = recolor_rocket(ROCKET_ROWS, C_P2)
-rocket_p2_flame = recolor_rocket(ROCKET_FLAME_ROWS, C_P2)
-
-PAL_HEART = {
-    ".": None,
-    "R": (255, 70, 90),
-    "r": (200, 40, 70),
-    "W": (255, 190, 200),
-}
-HEART_ROWS = [
-    ".RR..RR.",
-    "RWRRRWWR",   # W highlight
-    "RRRRRRRR",
-    "RRRRRRRR",
-    ".rRRRRr.",
-    "..rRRr..",
-    "...rr...",
-    "........",
-]
-heart_full = render_sprite(HEART_ROWS, PAL_HEART)
-PAL_HEART_OFF = {"R": (70, 60, 85), "r": (50, 45, 65), "W": (90, 85, 105)}
-heart_empty = render_sprite(HEART_ROWS, PAL_HEART_OFF)
-
-PAL_SKULL = {
-    ".": None,
-    "W": (225, 225, 235),
-    "K": (30, 30, 40),
-    "G": (120, 120, 135),
-}
-SKULL_ROWS = [
-    ".WWWWW.",
-    "WWWWWWW",
-    "WKWWWKW",
-    "WKWWWKW",
-    "WWWWWWW",
-    "W.WWW.W",
-    ".WWWWW.",
-    ".W.W.W.",
-]
-skull_icon = render_sprite(SKULL_ROWS, PAL_SKULL)
-
-PAL_STAR = {
-    ".": None,
-    "Y": (255, 210, 80),
-    "y": (210, 150, 40),
-    "W": (255, 245, 200),
-}
-STAR_ROWS = [
-    "....Y....",
-    "....Y....",
-    "...YWY...",
-    "YYYYYYYYY",
-    ".YYYYYYY.",
-    "..YYYYY..",
-    ".YYY.YYY.",
-    ".YY...YY.",
-]
-star_on = render_sprite(STAR_ROWS, PAL_STAR)
-star_off = render_sprite(STAR_ROWS, {"Y": (60, 60, 80), "y": (45, 45, 60),
-                                     "W": (75, 75, 95)})
-
-PAL_TROPHY = {
-    ".": None,
-    "Y": (255, 205, 70),
-    "y": (200, 145, 40),
-    "W": (255, 245, 190),
-    "B": (120, 80, 40),
-}
-TROPHY_ROWS = [
-    "YYYYYYYYY",
-    "YWYYYYYy.",
-    " YYYYYYY.",
-    ".YYYYYYY.",
-    "..YYYYY..",
-    "...YYY...",
-    "....Y....",
-    "...BBB...",
-    "..BBBBB..",
-]
-trophy_icon = render_sprite(TROPHY_ROWS, PAL_TROPHY)
-
-PAL_ZAP = {
-    ".": None,
-    "Y": (255, 235, 90),
-    "O": (255, 170, 40),
-}
-ZAP_ROWS = [
-    "...YY..",
-    "..YYY..",
-    ".YYYYY.",
-    "YYYYYO.",
-    "..YYY..",
-    ".YYY...",
-    "YYY....",
-    "YY.....",
-]
-zap_icon = render_sprite(ZAP_ROWS, PAL_ZAP)
-
-PAL_KEYCAP = {
-    ".": None,
-    "L": (205, 205, 220),
-    "D": (120, 120, 140),
-    "K": (40, 40, 55),
-}
-KEYCAP_ROWS = [
-    "LLLLLLL",
-    "LDDDDDL",
-    "LDKKKDL",
-    "LDKKKDL",
-    "LDKKKDL",
-    "LDDDDDL",
-    "LLLLLLL",
-]
-keycap_blue = render_sprite(KEYCAP_ROWS,
-                            {**PAL_KEYCAP, "L": C_P1, "D": C_P1_DARK})
-keycap_red = render_sprite(KEYCAP_ROWS,
-                           {**PAL_KEYCAP, "L": C_P2, "D": C_P2_DARK})
-
-# ======================================================================
-# BACKGROUND - starfield + parallax skyline (drawn onto low-res buffer)
-# ======================================================================
-rng_bg = random.Random(1337)
-STARS = [(rng_bg.randint(0, PX_W - 1), rng_bg.randint(0, PX_H // 2),
-          rng_bg.choice([(180, 180, 220), C_STAR, (255, 240, 180)]),
-          rng_bg.random() * 6.28) for _ in range(70)]
-
-def make_skyline(seed, base_y, hmin, hmax, color):
-    r = random.Random(seed)
-    buildings = []
-    x = 0
-    while x < PX_W:
-        w = r.randint(14, 34)
-        h = r.randint(hmin, hmax)
-        wins = []
-        for wy in range(base_y - h + 4, base_y - 3, 6):
-            for wx in range(x + 3, x + w - 3, 5):
-                if r.random() < 0.4:
-                    wins.append((wx, wy, r.choice([(255, 220, 120),
-                                                   (120, 220, 255),
-                                                   (255, 150, 180)])))
-        buildings.append((x, base_y - h, w, h, wins))
-        x += w + r.randint(2, 6)
-    return buildings, color
-
-SKY_FAR = make_skyline(42, PX_H - 40, 30, 90, (38, 30, 70))
-SKY_NEAR = make_skyline(7, PX_H - 8, 45, 130, (24, 18, 48))
-
-
-def draw_background(surf, t, fever=False):
-    # vertical gradient sky
-    for y in range(PX_H):
-        f = y / PX_H
-        if fever:
-            pulse = 0.5 + 0.5 * math.sin(t * 6)
-            col = (int(40 + 60 * pulse + 30 * f),
-                   int(12 + 25 * f),
-                   int(40 + 20 * (1 - f)))
+def hero_sprite(player=0):
+    key = ("hero", player)
+    if key not in _spr_cache:
+        if player == 0:
+            _spr_cache[key] = make_sprite(HERO)
         else:
-            col = (int(C_BG_TOP[0] + (C_BG_BOT[0] - C_BG_TOP[0]) * f),
-                   int(C_BG_TOP[1] + (C_BG_BOT[1] - C_BG_TOP[1]) * f),
-                   int(C_BG_TOP[2] + (C_BG_BOT[2] - C_BG_TOP[2]) * f))
-        pygame.draw.line(surf, col, (0, y), (PX_W, y))
-
-    # twinkling stars
-    for sx, sy, sc, ph in STARS:
-        b = 0.55 + 0.45 * math.sin(t * 2.4 + ph)
-        c = tuple(int(v * b) for v in sc)
-        surf.set_at((sx, sy), c)
-
-    # moon
-    pygame.draw.circle(surf, (235, 235, 215), (PX_W - 70, 46), 14)
-    pygame.draw.circle(surf, (210, 210, 195), (PX_W - 74, 43), 4)
-    pygame.draw.circle(surf, (210, 210, 195), (PX_W - 64, 51), 3)
-
-    # skylines
-    buildings, colr = SKY_FAR
-    for bx, by, bw, bh, wins in buildings:
-        pygame.draw.rect(surf, colr, (bx, by, bw, bh))
-        for wx, wy, wc in wins:
-            if 0 <= wx < PX_W and wy < PX_H:
-                surf.set_at((wx, wy), wc)
-                surf.set_at((wx + 1, wy), wc)
-    buildings, colr = SKY_NEAR
-    for bx, by, bw, bh, wins in buildings:
-        pygame.draw.rect(surf, colr, (bx, by, bw, bh))
-        for wx, wy, wc in wins:
-            blink = ((int(t * 2) + wx + bx) % 7) != 0
-            if blink and 0 <= wx < PX_W:
-                surf.set_at((wx, wy), wc)
-
-    # ground strip
-    pygame.draw.rect(surf, (14, 10, 30), (0, PX_H - 8, PX_W, 8))
+            remap = {"8": "6", "2": "1", "6": "e", "e": "b"}
+            _spr_cache[key] = pygame.transform.flip(make_sprite(HERO, remap=remap), True, False)
+    return _spr_cache[key]
 
 
-# ======================================================================
-# PARTICLES
-# ======================================================================
-class Particle:
-    def __init__(self, x, y, color, vx=None, vy=None, life=None, size=None,
-                 gravity=300):
-        self.x, self.y = x, y
-        self.vx = random.uniform(-140, 140) if vx is None else vx
-        self.vy = random.uniform(-170, 40) if vy is None else vy
-        self.life = self.max_life = life or random.uniform(0.3, 0.7)
-        self.color = color
-        self.size = size or random.choice([1, 1, 2, 2, 3])
-        self.gravity = gravity
+def enemy_sprite(kind, hue=0.0, scale=1):
+    key = ("enemy", kind, round(hue, 2), scale)
+    if key not in _spr_cache:
+        s = make_sprite(ENEMY_ART[kind], hue)
+        if scale > 1:
+            s = pygame.transform.scale(s, (s.get_width() * scale, s.get_height() * scale))
+        _spr_cache[key] = s
+    return _spr_cache[key]
+
+
+def icon(name, empty=False):
+    key = ("icon", name, empty)
+    if key not in _spr_cache:
+        data = {"heart": HEART, "star": STAR, "lock": LOCK, "skull": SKULL_ICON}[name]
+        remap = None
+        if empty:
+            remap = {"6": "3", "f": "3", "e": "3"}
+        elif name == "star":
+            remap = {"e": "e"}
+        _spr_cache[key] = outlined(make_sprite(data, remap=remap))
+    return _spr_cache[key]
+
+
+def big_icon(name, empty=False, scale=2):
+    key = ("bigicon", name, empty, scale)
+    if key not in _spr_cache:
+        i = icon(name, empty)
+        _spr_cache[key] = pygame.transform.scale(i, (i.get_width() * scale, i.get_height() * scale))
+    return _spr_cache[key]
+
+
+_shadow_cache = {}
+
+
+def draw_shadow(s, cx, y, w):
+    img = _shadow_cache.get(w)
+    if img is None:
+        img = pygame.Surface((w, 4), pygame.SRCALPHA)
+        pygame.draw.ellipse(img, (20, 12, 28, 110), (0, 0, w, 4))
+        _shadow_cache[w] = img
+    s.blit(img, (cx - w // 2, y - 2))
+
+
+def blit_char(s, spr, left, feet, flash=None, alpha=255, flip=False):
+    img = silhouette(spr, flash) if flash else spr
+    if flip:
+        img = pygame.transform.flip(img, True, False)
+    if alpha < 255:
+        img = img.copy()
+        img.set_alpha(alpha)
+    s.blit(img, (int(left), int(feet - spr.get_height())))
+
+
+# --------------------------------------------------------------------------
+#  UI HELPERS
+# --------------------------------------------------------------------------
+def panel(s, rect, fill=NAVY, alpha=None):
+    x, y, w, h = rect
+    if alpha is not None:
+        tmp = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.rect(tmp, fill + (alpha,), (0, 0, w, h))
+        s.blit(tmp, (x, y))
+    else:
+        pygame.draw.rect(s, fill, rect)
+    pygame.draw.rect(s, INK, rect, 1)
+    pygame.draw.rect(s, STEEL, (x + 1, y + 1, w - 3, 1))
+    pygame.draw.rect(s, STEEL, (x + 1, y + 1, 1, h - 3))
+    pygame.draw.rect(s, CHAR, (x + 1, y + h - 2, w - 2, 1))
+    pygame.draw.rect(s, CHAR, (x + w - 2, y + 1, 1, h - 2))
+
+
+def keycap(s, label, cx, y, color=WHITE):
+    w = text_width(label) + 7
+    x = cx - w // 2
+    pygame.draw.rect(s, INK, (x, y, w, 11))
+    pygame.draw.rect(s, STEEL, (x + 1, y + 1, w - 2, 8))
+    pygame.draw.rect(s, CHAR, (x + 1, y + 9, w - 2, 1))
+    draw_text(s, label, cx, y + 2, INK, align="center", shadow=None)
+
+
+def bar_gauge(s, x, y, w, h, frac, fill, back=CHAR, hi=WHITE):
+    pygame.draw.rect(s, INK, (x - 1, y - 1, w + 2, h + 2))
+    pygame.draw.rect(s, back, (x, y, w, h))
+    fw = int(round(w * max(0.0, min(1.0, frac))))
+    if fw > 0:
+        pygame.draw.rect(s, fill, (x, y, fw, h))
+        if h >= 4:
+            pygame.draw.rect(s, hi, (x, y, fw, 1))
+
+
+# --------------------------------------------------------------------------
+#  BACKGROUNDS  (pre-rendered once per theme)
+# --------------------------------------------------------------------------
+def banded(s, y0, y1, colors):
+    """Vertical colour bands with a 4-row dithered blend between them."""
+    n = len(colors)
+    bh = (y1 - y0) / n
+    for i, c in enumerate(colors):
+        ya, yb = int(y0 + i * bh), int(y0 + (i + 1) * bh)
+        pygame.draw.rect(s, c, (0, ya, W, yb - ya))
+    for i in range(n - 1):
+        c, nc = colors[i], colors[i + 1]
+        if c == nc:
+            continue
+        yb = int(y0 + (i + 1) * bh)
+        for dy, mod, col, off in ((-2, 4, nc, 0), (-1, 2, nc, 0), (0, 2, c, 1), (1, 4, c, 1)):
+            for x in range(W):
+                if x % mod == off and 0 <= yb + dy < H:
+                    s.set_at((x, yb + dy), col)
+
+
+def hills(s, color, base, amp, freq, phase):
+    for x in range(W):
+        y = base + int(amp * math.sin(x * freq + phase) + amp * 0.5 * math.sin(x * freq * 2.3 + phase * 2))
+        pygame.draw.line(s, color, (x, y), (x, FLOOR_Y))
+
+
+def cloud(s, x, y):
+    for dx, dy, w, h in ((0, 4, 30, 6), (4, 1, 20, 6), (14, 0, 14, 5), (-3, 6, 36, 3)):
+        pygame.draw.rect(s, WHITE, (x + dx, y + dy, w, h))
+    pygame.draw.rect(s, CYAN, (x - 3, y + 9, 36, 1))
+
+
+def _bg_meadow(s):
+    banded(s, 0, FLOOR_Y, [BLUE, BLUE, CYAN, CYAN, WHITE])
+    pygame.draw.circle(s, YELLOW, (262, 34), 12)
+    pygame.draw.circle(s, WHITE, (262, 34), 7)
+    for cx, cy in ((30, 28), (118, 50), (196, 20), (284, 70)):
+        cloud(s, cx, cy)
+    hills(s, STEEL, 100, 14, 0.021, 0.5)
+    hills(s, GREEN, 114, 8, 0.034, 2.0)
+    hills(s, FOREST, 124, 4, 0.05, 4.0)
+    rng = random.Random(3)
+    for tx in (14, 40, 288, 306):          # little pine trees
+        for i in range(4):
+            pygame.draw.rect(s, FOREST, (tx - 3 - i * 2, 92 + i * 9, 7 + i * 4, 9))
+            pygame.draw.rect(s, GREEN, (tx - 3 - i * 2, 92 + i * 9, 7 + i * 4, 1))
+        pygame.draw.rect(s, BROWN, (tx - 1, 128, 3, 4))
+    pygame.draw.rect(s, GREEN, (0, FLOOR_Y, W, 3))
+    pygame.draw.rect(s, FOREST, (0, FLOOR_Y + 3, W, 2))
+    pygame.draw.rect(s, BROWN, (0, FLOOR_Y + 5, W, H))
+    for _ in range(90):
+        x, y = rng.randrange(W), rng.randrange(FLOOR_Y + 7, H)
+        s.set_at((x, y), rng.choice((CHAR, ORANGE)))
+    for x in range(0, W, 6):
+        pygame.draw.rect(s, GREEN, (x + rng.randrange(3), FLOOR_Y - 2, 1, 2))
+
+
+def _bg_cave(s):
+    banded(s, 0, FLOOR_Y, [INK, INK, WINE, WINE])
+    rng = random.Random(5)
+    for _ in range(46):                      # rock wall blobs
+        x, y = rng.randrange(W), rng.randrange(20, FLOOR_Y - 6)
+        pygame.draw.rect(s, rng.choice((CHAR, INK, WINE)), (x, y, rng.randrange(6, 20), rng.randrange(3, 8)))
+    for x in range(-4, W, 22):               # stalactites
+        x += rng.randrange(8)
+        hgt = rng.randrange(14, 40)
+        pygame.draw.polygon(s, CHAR, [(x, 0), (x + 16, 0), (x + 8, hgt)])
+        pygame.draw.polygon(s, INK, [(x + 8, 0), (x + 16, 0), (x + 8, hgt)])
+    pygame.draw.rect(s, CHAR, (0, FLOOR_Y, W, 4))
+    pygame.draw.rect(s, STONE, (0, FLOOR_Y, W, 1))
+    pygame.draw.rect(s, INK, (0, FLOOR_Y + 4, W, H))
+    for y in range(FLOOR_Y + 4, H, 11):
+        pygame.draw.rect(s, CHAR, (0, y, W, 1))
+        off = (y // 11) % 2 * 16
+        for x in range(off, W, 32):
+            pygame.draw.rect(s, CHAR, (x, y, 1, 11))
+    for x in range(10, W, 40):               # stalagmites
+        h2 = rng.randrange(6, 16)
+        pygame.draw.polygon(s, CHAR, [(x, FLOOR_Y), (x + 10, FLOOR_Y), (x + 5, FLOOR_Y - h2)])
+
+
+def _bg_castle(s):
+    pygame.draw.rect(s, CHAR, (0, 0, W, FLOOR_Y))
+    for row, y in enumerate(range(0, FLOOR_Y, 10)):
+        pygame.draw.rect(s, INK, (0, y, W, 1))
+        for x in range((row % 2) * 12 - 12, W, 24):
+            pygame.draw.rect(s, INK, (x, y, 1, 10))
+            pygame.draw.rect(s, STONE, (x + 1, y + 1, 22, 1))
+    for wx in (46, 138, 226):                # arched windows
+        pygame.draw.rect(s, INK, (wx - 1, 29, 30, 50))
+        pygame.draw.rect(s, NAVY, (wx + 1, 40, 26, 38))
+        pygame.draw.circle(s, INK, (wx + 14, 40), 15)
+        pygame.draw.circle(s, NAVY, (wx + 14, 40), 13)
+        pygame.draw.rect(s, BLUE, (wx + 1, 56, 26, 1))
+        pygame.draw.rect(s, INK, (wx + 13, 28, 2, 50))
+    for bx in (12, 96, 182, 270):            # banners
+        pygame.draw.rect(s, INK, (bx - 1, 6, 20, 44))
+        pygame.draw.rect(s, RED, (bx, 6, 18, 40))
+        pygame.draw.polygon(s, RED, [(bx, 46), (bx + 18, 46), (bx + 9, 54)])
+        pygame.draw.rect(s, YELLOW, (bx + 7, 14, 4, 12))
+        pygame.draw.rect(s, YELLOW, (bx + 4, 18, 10, 4))
+    pygame.draw.rect(s, STONE, (0, FLOOR_Y, W, 2))
+    pygame.draw.rect(s, STEEL, (0, FLOOR_Y + 2, W, H))
+    for i, y in enumerate(range(FLOOR_Y + 2, H, 9)):
+        for x in range(-16 * (i % 2), W, 32):
+            pygame.draw.rect(s, STONE, (x, y, 16, 9))
+        pygame.draw.rect(s, CHAR, (0, y, W, 1))
+
+
+def _bg_volcano(s):
+    banded(s, 0, FLOOR_Y, [INK, WINE, WINE, RED, ORANGE])
+    rng = random.Random(9)
+    for cx, hgt, wid in ((60, 70, 90), (170, 90, 110), (270, 60, 80)):
+        pygame.draw.polygon(s, INK, [(cx - wid, FLOOR_Y), (cx, FLOOR_Y - hgt), (cx + wid, FLOOR_Y)])
+        pygame.draw.polygon(s, WINE, [(cx - 6, FLOOR_Y - hgt + 6), (cx, FLOOR_Y - hgt), (cx + 6, FLOOR_Y - hgt + 6)])
+        pygame.draw.rect(s, ORANGE, (cx - 2, FLOOR_Y - hgt, 4, 2))
+    for _ in range(60):
+        s.set_at((rng.randrange(W), rng.randrange(0, 60)), rng.choice((ORANGE, YELLOW, RED)))
+    pygame.draw.rect(s, INK, (0, FLOOR_Y, W, H))
+    pygame.draw.rect(s, ORANGE, (0, FLOOR_Y, W, 1))
+    for i in range(14):                      # lava cracks
+        x, y = rng.randrange(W), rng.randrange(FLOOR_Y + 4, H - 2)
+        for _ in range(rng.randrange(4, 9)):
+            pygame.draw.rect(s, rng.choice((ORANGE, RED)), (x, y, 2, 1))
+            x += rng.choice((-2, 2, 2))
+            y += rng.choice((0, 1, 1))
+    for x in range(0, W, 9):
+        pygame.draw.rect(s, CHAR, (x, FLOOR_Y + 1, 5, 1))
+
+
+def _bg_void(s):
+    banded(s, 0, FLOOR_Y, [INK, INK, NAVY, NAVY, WINE])
+    rng = random.Random(13)
+    for _ in range(90):
+        s.set_at((rng.randrange(W), rng.randrange(FLOOR_Y)), rng.choice((WHITE, CYAN, STEEL, STEEL)))
+    pygame.draw.circle(s, BLUE, (74, 52), 24)
+    pygame.draw.circle(s, NAVY, (82, 58), 18)
+    pygame.draw.circle(s, INK, (74, 52), 24, 1)
+    pygame.draw.ellipse(s, STEEL, (36, 46, 76, 14), 1)
+    pygame.draw.circle(s, CYAN, (260, 30), 5)
+    pygame.draw.rect(s, INK, (0, FLOOR_Y, W, H))
+    pygame.draw.rect(s, CYAN, (0, FLOOR_Y, W, 1))
+    for i in range(1, 7):                    # perspective grid
+        y = FLOOR_Y + int((i / 6) ** 1.8 * (H - FLOOR_Y))
+        pygame.draw.rect(s, NAVY, (0, y, W, 1))
+    for x in range(-W, 2 * W, 34):
+        pygame.draw.line(s, NAVY, (W // 2 + (x - W // 2) // 4, FLOOR_Y), (x, H))
+
+
+_BG_BUILDERS = [_bg_meadow, _bg_cave, _bg_castle, _bg_volcano, _bg_void]
+_bg_cache = {}
+
+
+def get_bg(theme):
+    theme %= len(_BG_BUILDERS)
+    if theme not in _bg_cache:
+        s = pygame.Surface((W, H))
+        _BG_BUILDERS[theme](s)
+        _bg_cache[theme] = s
+    return _bg_cache[theme]
+
+
+class Ambient:
+    """Drifting particles + flickering torches for each theme."""
+
+    def __init__(self, theme):
+        self.theme = theme % 5
+        self.t = 0.0
+        rng = random.Random(self.theme + 77)
+        self.p = [[rng.uniform(0, W), rng.uniform(10, FLOOR_Y), rng.uniform(0.5, 1.5), rng.random() * 6.28]
+                  for _ in range(24)]
+        self.glow = pygame.Surface((56, 56), pygame.SRCALPHA)
+        for r, a in ((26, 22), (18, 30), (10, 40)):
+            pygame.draw.circle(self.glow, (210, 125, 44, a), (28, 28), r)
 
     def update(self, dt):
-        self.x += self.vx * dt
-        self.y += self.vy * dt
-        self.vy += self.gravity * dt
-        self.life -= dt
+        self.t += dt
+        th = self.theme
+        for p in self.p:
+            if th == 0:
+                p[0] = (p[0] + 10 * p[2] * dt) % W
+                p[1] += math.sin(self.t + p[3]) * 4 * dt
+            elif th == 1:
+                p[0] += math.cos(self.t * p[2] + p[3]) * 8 * dt
+                p[1] += math.sin(self.t * p[2] * 0.7 + p[3]) * 6 * dt
+            elif th == 2:
+                p[1] -= 3 * p[2] * dt
+                if p[1] < 0:
+                    p[1] = FLOOR_Y
+            elif th == 3:
+                p[1] -= 22 * p[2] * dt
+                p[0] += math.sin(self.t * 2 + p[3]) * 10 * dt
+                if p[1] < 0:
+                    p[1] = FLOOR_Y + 10
+            else:
+                pass
 
-    def draw(self, surf):
-        a = max(0.0, self.life / self.max_life)
-        s = max(1, int(self.size * (0.5 + a * 0.5)))
-        pygame.draw.rect(surf, self.color, (int(self.x), int(self.y), s, s))
-
-
-def spawn_burst(particles, x, y, colors, n=24, spread=160):
-    for _ in range(n):
-        ang = random.uniform(0, math.tau)
-        spd = random.uniform(40, spread)
-        particles.append(Particle(x, y, random.choice(colors),
-                                  vx=math.cos(ang) * spd,
-                                  vy=math.sin(ang) * spd - 60))
-
-
-# ======================================================================
-# FLOATING SCORE POPUPS
-# ======================================================================
-class Popup:
-    def __init__(self, text, x, y, color, big=False):
-        self.text, self.x, self.y = text, x, y
-        self.color = color
-        self.life = self.max_life = 0.9
-        self.big = big
-
-    def update(self, dt):
-        self.y -= 34 * dt
-        self.life -= dt
-
-    def draw(self, surf):
-        a = max(0.0, self.life / self.max_life)
-        col = tuple(int(c * (0.4 + 0.6 * a)) for c in self.color)
-        font = font_medium if self.big else font_small
-        draw_text_shadow(surf, self.text, font, col, int(self.x), int(self.y))
-
-
-# ======================================================================
-# PLAYER BAR (the timing tower + rocket cursor)
-# ======================================================================
-class PlayerBar:
-    def __init__(self, px_x, color, dark_color, prefix, rocket_idle_img,
-                 rocket_flame_img, cursor_speed=170, target_height=40):
-        self.rect = pygame.Rect(px_x * PIXEL_SCALE // PIXEL_SCALE, 0, 0, 0)
-        self.px = px_x                       # left edge, pixel units
-        self.color = color
-        self.dark = dark_color
-        self.prefix = prefix
-        self.img_idle = rocket_idle_img
-        self.img_flame = rocket_flame_img
-
-        self.score = 0
-        self.streak = 0
-        self.best_streak = 0
-        self.lives = 3
-        self.fever = 0.0                     # 0..1 combo meter
-        self.fever_time = 0.0                # seconds of active fever
-        self.hits = 0
-        self.perfects = 0
-
-        self.cursor_y = float(BAR_Y)
-        self.cursor_speed = cursor_speed
-        self.base_speed = cursor_speed
-        self.cursor_dir = 1
-
-        self.target_h = target_height
-        self.target_y = BAR_Y + 20
-        self.randomize_target()
-
-        self.penalty_timer = 0.0
-        self.flash_timer = 0.0               # white hit-flash on target
-        self.red_flash = 0.0                 # miss flash
-        self.wobble = 0.0
-        self.last_result = None              # ("PERFECT"/"HIT"/"MISS", t)
-
-    def randomize_target(self):
-        self.target_y = random.randint(BAR_Y, BAR_Y + BAR_H - self.target_h)
-
-    @property
-    def fever_active(self):
-        return self.fever_time > 0
-
-    def update(self, dt):
-        if self.penalty_timer > 0:
-            self.penalty_timer -= dt
-        if self.flash_timer > 0:
-            self.flash_timer -= dt
-        if self.red_flash > 0:
-            self.red_flash -= dt
-        if self.wobble > 0:
-            self.wobble -= dt * 4
-        if self.fever_time > 0:
-            self.fever_time -= dt
-            if self.fever_time <= 0:
-                self.fever = 0.0
-
-        if self.penalty_timer > 0:
+    def draw(self, s, particles=True):
+        th = self.theme
+        if th in (1, 2):
+            for tx in (68, 252):
+                flick = int(self.t * 9 + tx) % 3
+                s.blit(self.glow, (tx - 28, 52 - 28 - flick))
+                pygame.draw.rect(s, INK, (tx - 2, 60, 5, 12))
+                pygame.draw.rect(s, BROWN, (tx - 1, 60, 3, 12))
+                pygame.draw.rect(s, ORANGE, (tx - 2, 52 - flick, 5, 8 + flick))
+                pygame.draw.rect(s, YELLOW, (tx - 1, 55 - flick, 3, 5 + flick))
+                pygame.draw.rect(s, WHITE, (tx, 58, 1, 2))
+        if not particles:
             return
+        colors = [WHITE, YELLOW, STEEL, ORANGE, CYAN][th]
+        for p in self.p:
+            x, y = int(p[0]) % W, int(p[1])
+            if th == 4 and math.sin(self.t * 3 + p[3]) < 0:
+                continue
+            if th == 1:
+                col = CYAN if math.sin(self.t * 4 + p[3]) > -0.3 else NAVY
+            elif th == 3:
+                col = ORANGE if p[2] > 1 else YELLOW
+            else:
+                col = colors
+            s.set_at((x, y), col)
+            if th in (0, 1) and p[2] > 1.2:
+                s.set_at((x + 1, y), col)
 
-        speed_mult = 1.35 if self.fever_active else 1.0
-        self.cursor_y += self.cursor_speed * speed_mult * self.cursor_dir * dt
-        top, bot = BAR_Y, BAR_Y + BAR_H
-        if self.cursor_y <= top:
-            self.cursor_y = top
-            self.cursor_dir = 1
-        elif self.cursor_y >= bot:
-            self.cursor_y = bot
-            self.cursor_dir = -1
 
-    def attempt_score(self):
-        """Returns 'PERFECT', 'GOOD' or 'MISS'."""
-        if self.penalty_timer > 0:
-            return None
-        cy = self.cursor_y
-        t0, t1 = self.target_y, self.target_y + self.target_h
-        mid = (t0 + t1) / 2
-        perfect_band = max(4.0, self.target_h * 0.18)
+# --------------------------------------------------------------------------
+#  AUDIO  (all sounds are synthesised at start-up; music builds in a thread)
+# --------------------------------------------------------------------------
+def _wave(kind, ph):
+    p = ph % 1.0
+    if kind == "sq":
+        return 1.0 if p < 0.5 else -1.0
+    if kind == "pulse":
+        return 1.0 if p < 0.25 else -1.0
+    if kind == "tri":
+        return 4.0 * abs(p - 0.5) - 1.0
+    if kind == "saw":
+        return 2.0 * p - 1.0
+    return random.uniform(-1.0, 1.0)
 
-        if t0 <= cy <= t1:
-            perfect = abs(cy - mid) <= perfect_band
-            mult = 1 + self.streak // 3
-            if self.fever_active:
-                mult *= 2
-            pts = (2 if perfect else 1) * mult
-            self.score += pts
-            self.streak += 1
-            self.best_streak = max(self.best_streak, self.streak)
-            self.hits += 1
-            if perfect:
-                self.perfects += 1
-            gain = 0.14 if perfect else 0.09
-            if not self.fever_active:
-                self.fever = min(1.0, self.fever + gain)
-                if self.fever >= 1.0:
-                    self.fever_time = 5.0
-            self.flash_timer = 0.25
-            self.cursor_speed = min(self.base_speed + 130,
-                                   self.cursor_speed + 6)
-            self.randomize_target()
-            self.last_result = ("PERFECT" if perfect else "GOOD", 0.7)
-            return "PERFECT" if perfect else "GOOD"
+
+def render_note(freq, dur, kind="sq", vol=0.3, slide=0.0, decay=1.0):
+    n = max(1, int(RATE * dur))
+    out = [0.0] * n
+    ph = 0.0
+    for i in range(n):
+        ph += (freq + slide * (i / n)) / RATE
+        env = (1.0 - i / n) ** decay if decay else 1.0
+        if i < 60:
+            env *= i / 60.0
+        out[i] = _wave(kind, ph) * vol * env
+    return out
+
+
+def midi(m):
+    return 440.0 * 2 ** ((m - 69) / 12.0)
+
+
+SFX_DEFS = {
+    "select": [(880, 0.04, "sq", 0.18)],
+    "confirm": [(523, 0.05, "sq", 0.2), (784, 0.09, "sq", 0.2)],
+    "back": [(392, 0.05, "sq", 0.18), (262, 0.07, "sq", 0.18)],
+    "good": [(660, 0.10, "pulse", 0.28, 330)],
+    "perfect": [(midi(72), 0.05, "pulse", 0.28), (midi(76), 0.05, "pulse", 0.28),
+                (midi(79), 0.05, "pulse", 0.28), (midi(84), 0.14, "pulse", 0.28)],
+    "power": [(300, 0.25, "sq", 0.25, 900), (midi(84), 0.18, "tri", 0.3)],
+    "miss": [(220, 0.22, "saw", 0.25, -140)],
+    "locked": [(150, 0.04, "sq", 0.12)],
+    "hurt": [(0, 0.25, "noise", 0.34, 0, 1.5), (130, 0.2, "saw", 0.25, -70)],
+    "thud": [(0, 0.06, "noise", 0.3), (160, 0.1, "sq", 0.25, -90)],
+    "heal": [(midi(72), 0.07, "tri", 0.3), (midi(76), 0.07, "tri", 0.3), (midi(79), 0.12, "tri", 0.3)],
+    "ko": [(0, 0.45, "noise", 0.3, 0, 1.3), (200, 0.4, "saw", 0.2, -150)],
+    "win": [(midi(72), 0.1, "pulse", 0.28), (midi(76), 0.1, "pulse", 0.28), (midi(79), 0.1, "pulse", 0.28),
+            (midi(84), 0.32, "pulse", 0.3)],
+    "lose": [(midi(67), 0.18, "sq", 0.25), (midi(63), 0.18, "sq", 0.25), (midi(60), 0.18, "sq", 0.25),
+             (midi(55), 0.45, "saw", 0.25, -30)],
+    "tick": [(440, 0.08, "sq", 0.2)],
+    "go": [(880, 0.25, "pulse", 0.3)],
+    "rage": [(180, 0.12, "saw", 0.2, 120), (240, 0.12, "saw", 0.2, 160)],
+}
+
+
+class Audio:
+    def __init__(self, app):
+        self.app = app
+        self.ok = False
+        self.sounds = {}
+        self.music_snd = None
+        self.music_chan = None
+        self.muted = False
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(RATE, -16, 1, 512)
+            freq, fmt, ch = pygame.mixer.get_init()
+            if fmt != -16:
+                return
+            self.channels = ch
+            self.ok = True
+            for name, notes in SFX_DEFS.items():
+                samples = []
+                for n in notes:
+                    f, d, kind, vol = n[0], n[1], n[2], n[3]
+                    slide = n[4] if len(n) > 4 else 0.0
+                    decay = n[5] if len(n) > 5 else 1.0
+                    samples += render_note(f, d, kind, vol, slide, decay)
+                snd = self._to_sound(samples)
+                snd.set_volume(0.55)
+                self.sounds[name] = snd
+            threading.Thread(target=self._build_music, daemon=True).start()
+        except Exception:
+            self.ok = False
+
+    def _to_sound(self, samples):
+        buf = array("h")
+        two = self.channels == 2
+        for v in samples:
+            iv = int(max(-1.0, min(1.0, v)) * 30000)
+            buf.append(iv)
+            if two:
+                buf.append(iv)
+        return pygame.mixer.Sound(buffer=buf.tobytes())
+
+    def _build_music(self):
+        try:
+            bpm = 138
+            eighth = 60.0 / bpm / 2
+            n8 = int(RATE * eighth)
+            chords = [([57, 60, 64], 45), ([53, 57, 60], 41), ([48, 52, 55], 48), ([55, 59, 62], 43)]
+            lead = [81, 79, 76, 79, 77, 76, 72, 76, 79, 76, 72, 76, 74, 71, 74, 79]
+            bars = 8
+            total = [0.0] * (bars * 8 * n8)
+
+            def mix(start, samples):
+                for i, v in enumerate(samples):
+                    if start + i < len(total):
+                        total[start + i] += v
+
+            li = 0
+            for bar in range(bars):
+                chord, root = chords[(bar // 2) % 4]
+                for e in range(8):
+                    pos = (bar * 8 + e) * n8
+                    arp = chord[[0, 1, 2, 1, 0, 1, 2, 1][e]] + 12
+                    mix(pos, render_note(midi(arp), eighth * 0.9, "pulse", 0.07, 0, 1.2))
+                    if e % 4 == 0:
+                        mix(pos, render_note(midi(root), eighth * 3.6, "tri", 0.2, 0, 0.5))
+                    if e in (0, 3, 6):
+                        mix(pos, render_note(midi(lead[li % len(lead)]), eighth * 1.8, "sq", 0.07, 0, 1.0))
+                        li += 1
+                    if e % 2 == 1:
+                        mix(pos, render_note(0, 0.03, "noise", 0.05, 0, 2.0))
+                    if e in (0, 4):
+                        mix(pos, render_note(120, 0.08, "sq", 0.12, -70, 2.0))
+            snd = self._to_sound(total)
+            snd.set_volume(0.32)
+            self.music_snd = snd
+            if self.app.cfg["music"] and not self.muted:
+                self._start_music()
+        except Exception:
+            pass
+
+    def _start_music(self):
+        if self.music_snd is not None and self.music_chan is None:
+            self.music_chan = self.music_snd.play(loops=-1)
+
+    def set_music(self, on):
+        if not self.ok:
+            return
+        if on and not self.muted:
+            self._start_music()
+        elif self.music_chan is not None:
+            self.music_chan.stop()
+            self.music_chan = None
+            if self.music_snd:
+                self.music_snd.stop()
+
+    def toggle_mute(self):
+        self.muted = not self.muted
+        if self.muted:
+            self.set_music(False)
         else:
-            self.streak = 0
-            self.lives -= 1
-            self.penalty_timer = 1.0
-            self.red_flash = 0.4
-            self.wobble = 1.0
-            if not self.fever_active:
-                self.fever = max(0.0, self.fever - 0.25)
-            self.cursor_speed = max(self.base_speed, self.cursor_speed - 12)
-            self.last_result = ("MISS", 0.7)
-            return "MISS"
+            self.set_music(self.app.cfg["music"])
 
-    # ---------------- drawing (pixel coords on low-res buffer) ----------
-    def draw(self, surf, particles, popups, t):
-        x, y = self.px, BAR_Y
-        wob = int(round(math.sin(t * 40) * self.wobble * 2)) if self.wobble > 0 else 0
-        x += wob
-
-        # tower body
-        pygame.draw.rect(surf, (26, 22, 48), (x, y, BAR_W, BAR_H))
-        # side rails with rivets
-        for rail_x in (x, x + BAR_W - 2):
-            pygame.draw.rect(surf, self.dark, (rail_x, y, 2, BAR_H))
-            for ry in range(y + 3, y + BAR_H - 2, 9):
-                surf.set_at((rail_x + 1, ry), (255, 255, 255))
-        # top/bottom caps
-        pygame.draw.rect(surf, self.dark, (x - 2, y - 4, BAR_W + 4, 4))
-        pygame.draw.rect(surf, self.dark, (x - 2, y + BAR_H, BAR_W + 4, 4))
-        # tick marks
-        for ty in range(y + 10, y + BAR_H, 20):
-            pygame.draw.line(surf, (48, 44, 80), (x + 4, ty), (x + 8, ty))
-
-        # target zone
-        ty0 = self.target_y
-        th = self.target_h
-        glow = 0.6 + 0.4 * math.sin(t * 5)
-        base_col = C_FEVER_B if self.fever_active else C_GREEN
-        zone_col = tuple(int(c * (0.55 + 0.45 * glow)) for c in base_col)
-        pygame.draw.rect(surf, (*zone_col,), (x + 2, ty0, BAR_W - 4, th))
-        # perfect band (brighter core)
-        pb = max(2, int(th * 0.18))
-        pmid = ty0 + th // 2
-        pygame.draw.rect(surf, C_WHITE, (x + 2, pmid - pb // 2, BAR_W - 4, pb))
-        # pulsing outline
-        oc = tuple(min(255, int(c * (0.7 + 0.3 * glow))) for c in base_col)
-        pygame.draw.rect(surf, oc, (x + 1, ty0 - 1, BAR_W - 2, th + 2), 1)
-        if self.flash_timer > 0:
-            fs = pygame.Surface((BAR_W, th + 8), pygame.SRCALPHA)
-            fs.fill((255, 255, 255, int(160 * self.flash_timer / 0.25)))
-            surf.blit(fs, (x, ty0 - 4))
-
-        # rocket cursor
-        rcx = x + BAR_W // 2
-        rcy = int(self.cursor_y)
-        img = self.img_flame if (self.penalty_timer <= 0 and
-                                 int(t * 12) % 2 == 0) else self.img_idle
-        if self.penalty_timer > 0:
-            img = self.img_idle
-        iw, ih = img.get_size()
-        surf.blit(img, (rcx - iw // 2, rcy - ih // 2))
-        if self.penalty_timer > 0 and int(t * 8) % 2 == 0:
-            ov = pygame.Surface((iw, ih), pygame.SRCALPHA)
-            ov.fill((255, 60, 60, 140))
-            surf.blit(ov, (rcx - iw // 2, rcy - ih // 2),
-                      special_flags=pygame.BLEND_ALPHA_SDL2)
-
-        # red miss flash over whole bar
-        if self.red_flash > 0:
-            ov = pygame.Surface((BAR_W + 4, BAR_H + 8), pygame.SRCALPHA)
-            ov.fill((255, 40, 40, int(110 * self.red_flash / 0.4)))
-            surf.blit(ov, (x - 2, y - 4))
-
-        # last-result label under the bar
-        if self.last_result:
-            label, ltime = self.last_result
-            if ltime > 0:
-                col = {"PERFECT": C_GOLD, "GOOD": C_GREEN, "MISS": C_RED}[label]
-                fnt = font_small if label == "PERFECT" else font_tiny
-                draw_text_shadow(surf, label, fnt, col,
-                                 x + BAR_W // 2, y + BAR_H + 14)
-
-    def update_timers(self, dt):
-        if self.last_result and self.last_result[1] > 0:
-            self.last_result = (self.last_result[0], self.last_result[1] - dt)
+    def play(self, name):
+        if self.ok and self.app.cfg["sfx"] and not self.muted:
+            snd = self.sounds.get(name)
+            if snd:
+                snd.play()
 
 
-# ======================================================================
-# LEVEL GENERATION
-# ======================================================================
-LEVEL_COUNT = 25
-DESCRIPTORS = ["Ignition", "Liftoff", "Focus", "Drift", "Rhythm", "Tempo",
-               "Surge", "Precision", "Velocity", "Momentum", "Gauntlet",
-               "Storm", "Blitz", "Nebula", "Quasar", "Overdrive", "Apex",
-               "Zenith", "Inferno", "Singularity", "Hyperlight", "Eclipse",
-               "Nova Burst", "Final Frontier", "The Core"]
+# --------------------------------------------------------------------------
+#  EFFECTS: particles, floating text, projectiles
+# --------------------------------------------------------------------------
+class Projectile:
+    def __init__(self, x0, y0, x1, y1, speed, color, on_hit):
+        self.x0, self.y0, self.x1, self.y1 = x0, y0, x1, y1
+        d = math.hypot(x1 - x0, y1 - y0)
+        self.dur = max(0.08, d / speed)
+        self.t = 0.0
+        self.color = color
+        self.on_hit = on_hit
+        self.x, self.y = x0, y0
+        self.done = False
 
 
-def generate_career_level(level_num):
-    target_score = 6 + min(level_num * 3, 60)
-    base_speed = min(300, 110 + (level_num - 1) * 9)      # pixel-units/sec
-    target_height = max(14, 44 - (level_num - 1) * 1)
-    time_limit = max(12.0, target_score * 1.15 + 6.0)
-    title = f"LVL {level_num}: {DESCRIPTORS[min(level_num - 1, len(DESCRIPTORS) - 1)]}"
+class FX:
+    def __init__(self, app):
+        self.app = app
+        self.parts, self.texts, self.shots = [], [], []
+
+    def burst(self, x, y, color, n=12, speed=90, life=0.5, grav=140, size=2):
+        if not self.app.cfg["particles"]:
+            return
+        for _ in range(n):
+            a = random.uniform(0, math.tau)
+            sp = random.uniform(0.3, 1.0) * speed
+            self.parts.append([x, y, math.cos(a) * sp, math.sin(a) * sp - 20, random.uniform(0.5, 1.0) * life,
+                               life, random.choice((1, size)), color])
+
+    def text(self, txt, x, y, color=WHITE, scale=1, life=0.9):
+        self.texts.append([txt, x, y, life, life, color, scale])
+
+    def shot(self, x0, y0, x1, y1, speed, color, on_hit):
+        self.shots.append(Projectile(x0, y0, x1, y1, speed, color, on_hit))
+
+    def update(self, dt):
+        for p in self.parts:
+            p[0] += p[2] * dt
+            p[1] += p[3] * dt
+            p[3] += 140 * dt
+            p[4] -= dt
+        self.parts = [p for p in self.parts if p[4] > 0]
+        for t in self.texts:
+            t[2] -= 14 * dt
+            t[3] -= dt
+        self.texts = [t for t in self.texts if t[3] > 0]
+        for sh in self.shots:
+            sh.t += dt
+            f = min(1.0, sh.t / sh.dur)
+            sh.x = sh.x0 + (sh.x1 - sh.x0) * f
+            sh.y = sh.y0 + (sh.y1 - sh.y0) * f
+            if self.app.cfg["particles"] and random.random() < 0.8:
+                self.parts.append([sh.x, sh.y, random.uniform(-15, 15), random.uniform(-15, 15), 0.25, 0.25, 1, sh.color])
+            if f >= 1.0:
+                sh.done = True
+                sh.on_hit()
+        self.shots = [sh for sh in self.shots if not sh.done]
+
+    def draw(self, s):
+        for p in self.parts:
+            col = p[7] if p[4] > p[5] * 0.35 else STEEL
+            s.fill(col, (int(p[0]), int(p[1]), p[6], p[6]))
+        for sh in self.shots:
+            x, y = int(sh.x), int(sh.y)
+            pygame.draw.rect(s, INK, (x - 4, y - 2, 9, 5))
+            pygame.draw.rect(s, sh.color, (x - 3, y - 1, 7, 3))
+            pygame.draw.rect(s, WHITE, (x - 1, y - 1, 3, 1))
+        for t in self.texts:
+            if t[3] < 0.25 and int(t[3] * 40) % 2 == 0:
+                continue
+            draw_text(s, t[0], t[1], t[2], t[5], t[6], "center")
+
+
+# --------------------------------------------------------------------------
+#  TIMING BAR  (the heart of the game)
+# --------------------------------------------------------------------------
+class TimingBar:
+    W = 16
+
+    def __init__(self, x, top=BAR_TOP, h=BAR_H, color=YELLOW):
+        self.x, self.top, self.h, self.color = x, top, h, color
+        self.scale = 1.0
+        self.configure(0.6, 0.3, [], 0.8)
+
+    def configure(self, speed, zone, mods, lock):
+        self.base_speed = speed
+        self.speed_mult = 1.0
+        self.base_zone = self.zone = zone
+        self.mods = set(mods)
+        self.lock_time = lock
+        self.pos = random.random()
+        self.dir = 1
+        self.lock = 0.0
+        self.t = 0.0
+        self.flip_t = random.uniform(1.0, 2.2)
+        self.drift_dir = random.choice((-1, 1))
+        self.zone_c = 0.5
+        self.decoy_c = None
+        self.flash = 0.0
+        self.place_zone()
+
+    def speed(self):
+        return min(self.base_speed * self.speed_mult * self.scale, 1.75)
+
+    def place_zone(self):
+        half = self.zone / 2
+        c = 0.5
+        for _ in range(30):
+            c = random.uniform(half + 0.03, 1 - half - 0.03)
+            if abs(c - self.pos) > 0.22 and abs(c - self.zone_c) > 0.12:
+                break
+        self.zone_c = c
+        self.decoy_c = None
+        if "decoy" in self.mods:
+            dh = self.zone * 0.7
+            for _ in range(30):
+                d = random.uniform(dh / 2 + 0.03, 1 - dh / 2 - 0.03)
+                if abs(d - c) > half + dh / 2 + 0.07:
+                    self.decoy_c = d
+                    break
+
+    def visible(self):
+        return "blink" not in self.mods or (self.t % 2.2) < 1.3
+
+    def update(self, dt):
+        self.t += dt
+        self.flash = max(0.0, self.flash - dt)
+        if self.lock > 0:
+            self.lock -= dt
+            return
+        if "flip" in self.mods:
+            self.flip_t -= dt
+            if self.flip_t <= 0:
+                self.dir *= -1
+                self.flip_t = random.uniform(1.2, 2.6)
+        spd = self.speed()
+        if "erratic" in self.mods:
+            spd *= 1 + 0.45 * math.sin(self.t * 3.3)
+        self.pos += self.dir * spd * dt
+        if self.pos <= 0:
+            self.pos, self.dir = 0.0, 1
+        elif self.pos >= 1:
+            self.pos, self.dir = 1.0, -1
+        if "drift" in self.mods:
+            half = self.zone / 2
+            self.zone_c += self.drift_dir * 0.13 * dt
+            if self.zone_c < half + 0.02:
+                self.zone_c, self.drift_dir = half + 0.02, 1
+            elif self.zone_c > 1 - half - 0.02:
+                self.zone_c, self.drift_dir = 1 - half - 0.02, -1
+
+    def press(self):
+        """Returns None (locked), 'perfect', 'good', 'miss' or 'decoy'."""
+        if self.lock > 0:
+            return None
+        half = self.zone / 2
+        d = abs(self.pos - self.zone_c)
+        if d <= half:
+            perfect = d <= half * 0.34
+            self.speed_mult = min(self.speed_mult + 0.03, 1.5)
+            if "shrink" in self.mods:
+                self.zone = max(0.10, self.zone * 0.92)
+            self.flash = 0.12
+            self.place_zone()
+            return "perfect" if perfect else "good"
+        res = "miss"
+        if self.decoy_c is not None and abs(self.pos - self.decoy_c) <= self.zone * 0.35:
+            res = "decoy"
+        self.lock = self.lock_time
+        self.speed_mult = 1.0
+        self.zone = self.base_zone
+        return res
+
+    def cursor_y(self):
+        return self.top + int(round(self.pos * self.h))
+
+    def draw(self, s, show_zone=True):
+        x, top, h, w = self.x, self.top, self.h, self.W
+        pygame.draw.rect(s, INK, (x - 4, top - 4, w + 8, h + 8))
+        pygame.draw.rect(s, STEEL, (x - 3, top - 3, w + 6, h + 6))
+        pygame.draw.rect(s, WHITE, (x - 3, top - 3, w + 6, 1))
+        pygame.draw.rect(s, CHAR, (x - 3, top + h + 2, w + 6, 1))
+        pygame.draw.rect(s, INK, (x - 1, top - 1, w + 2, h + 2))
+        pygame.draw.rect(s, NAVY, (x, top, w, h))
+        for i in range(1, 10):
+            ty = top + i * h // 10
+            pygame.draw.rect(s, CHAR, (x, ty, 3, 1))
+            pygame.draw.rect(s, CHAR, (x + w - 3, ty, 3, 1))
+        if show_zone:
+            if self.decoy_c is not None:
+                dh = max(3, int(self.zone * 0.7 * h))
+                dy = top + int((self.decoy_c - self.zone * 0.35) * h)
+                for i in range(dh):
+                    pygame.draw.rect(s, RED if i % 2 == 0 else WINE, (x + 1, dy + i, w - 2, 1))
+                pygame.draw.rect(s, INK, (x + 1, dy, w - 2, 1))
+                pygame.draw.rect(s, INK, (x + 1, dy + dh - 1, w - 2, 1))
+            if self.visible():
+                zy0 = top + int(round((self.zone_c - self.zone / 2) * h))
+                zy1 = top + int(round((self.zone_c + self.zone / 2) * h))
+                zh = max(3, zy1 - zy0)
+                pygame.draw.rect(s, FOREST, (x, zy0, w, zh))
+                pygame.draw.rect(s, GREEN, (x + 1, zy0 + 1, w - 2, max(1, zh - 2)))
+                ph = max(2, int(round(zh * 0.34)))
+                py = zy0 + (zh - ph) // 2
+                pygame.draw.rect(s, YELLOW, (x + 1, py, w - 2, ph))
+                pygame.draw.rect(s, WHITE, (x + 1, py, w - 2, 1))
+                if self.flash > 0:
+                    pygame.draw.rect(s, WHITE, (x, zy0, w, zh))
+            else:
+                for yy in range(top + 2, top + h - 2, 8):   # faint hint it's still there
+                    if (self.t * 6) % 2 < 1:
+                        s.set_at((x + 1, yy), FOREST)
+        cy = self.cursor_y()
+        locked = self.lock > 0
+        col = RED if locked and int(self.t * 16) % 2 == 0 else (STEEL if locked else WHITE)
+        cap = RED if locked else self.color
+        pygame.draw.rect(s, INK, (x - 7, cy - 2, w + 14, 5))
+        pygame.draw.rect(s, col, (x - 6, cy - 1, w + 12, 3))
+        pygame.draw.rect(s, INK, (x - 11, cy - 4, 5, 9))
+        pygame.draw.rect(s, INK, (x + w + 6, cy - 4, 5, 9))
+        pygame.draw.rect(s, cap, (x - 10, cy - 3, 3, 7))
+        pygame.draw.rect(s, cap, (x + w + 7, cy - 3, 3, 7))
+
+
+# --------------------------------------------------------------------------
+#  LEVEL GENERATION
+# --------------------------------------------------------------------------
+ENEMIES = [
+    {"kind": "slime", "name": "SLIME", "mods": [], "hp": 1.0, "boss": "SLIME KING"},
+    {"kind": "bat", "name": "BAT", "mods": ["erratic"], "hp": 0.9, "boss": "BAT LORD"},
+    {"kind": "goblin", "name": "GOBLIN", "mods": ["drift"], "hp": 1.1, "boss": "GOBLIN CHIEF"},
+    {"kind": "skull", "name": "SKELETON", "mods": ["decoy"], "hp": 1.0, "boss": "THE LICH"},
+    {"kind": "ghost", "name": "GHOST", "mods": ["blink"], "hp": 0.9, "boss": "PHANTOM"},
+    {"kind": "golem", "name": "GOLEM", "mods": ["shrink"], "hp": 1.3, "boss": "TITAN"},
+]
+MOD_TEXT = {
+    "erratic": "WILD SPEED", "drift": "DRIFTING ZONE", "decoy": "RED TRAP ZONE",
+    "blink": "VANISHING ZONE", "shrink": "SHRINKING ZONE", "flip": "SUDDEN REVERSE",
+}
+TIER_PREFIX = ["", "ANGRY ", "ELITE ", "DEADLY ", "ANCIENT "]
+_MOD_POOL = ["flip", "drift", "erratic", "blink", "decoy", "shrink"]
+
+
+def make_level(n):
+    boss = n % 5 == 0
+    e = ENEMIES[(n // 5 - 1) % len(ENEMIES)] if boss else ENEMIES[(n - 1) % len(ENEMIES)]
+    tier = (n - 1) // 6
+    mods = list(e["mods"])
+    if boss:
+        for m in ("flip", _MOD_POOL[(n // 5) % len(_MOD_POOL)]):
+            if m not in mods:
+                mods.append(m)
+    else:
+        for j in range(min(tier, 3)):
+            m = _MOD_POOL[(n + j) % len(_MOD_POOL)]
+            if m not in mods:
+                mods.append(m)
+    hp = max(3, int(round(min(14, 3 + n // 2) * e["hp"])))
+    if boss:
+        hp = int(hp * 1.6) + 2
     return {
-        "level": level_num,
-        "title": title,
-        "target_score": target_score,
-        "time_limit": time_limit,
-        "cursor_speed": base_speed,
-        "target_height": target_height,
+        "level": n, "boss": boss, "kind": e["kind"],
+        "name": e["boss"] if boss else TIER_PREFIX[min(tier, 4)] + e["name"],
+        "hue": ((0.55 + 0.13 * tier) % 1.0) if boss else (0.13 * tier) % 1.0,
+        "mods": mods, "hp": hp,
+        "speed": min(1.35, 0.55 + 0.04 * (n - 1)) * (1.05 if boss else 1.0),
+        "zone": max(0.12, 0.34 - 0.007 * (n - 1) - (0.02 if boss else 0.0)),
+        "gauge_time": max(3.4, 9.5 - 0.2 * (n - 1)) * (0.85 if boss else 1.0),
+        "theme": ((n - 1) // 5) % 5,
     }
 
 
-def stars_for(score_data, p1):
-    """0-3 stars based on performance."""
-    stars = 0
-    if p1.score >= score_data["target_score"]:
-        stars = 1
-        ratio = p1.score / max(1, score_data["target_score"])
-        if ratio >= 1.5 or p1.lives >= 2:
-            stars = 2
-        if ratio >= 1.8 and p1.lives == 3 and p1.perfects >= 3:
-            stars = 3
-    return stars
+# --------------------------------------------------------------------------
+#  SCENES
+# --------------------------------------------------------------------------
+K = pygame
+KEYNAMES = {pygame.K_SPACE: "SPACE", pygame.K_ESCAPE: "ESC", pygame.K_RETURN: "ENTER"}
 
 
-# ======================================================================
-# MENU HELPERS - pixel-art menu cards with animated icons
-# ======================================================================
-MENU_ITEMS = [
-    ("1", "CAREER MISSIONS", C_GOLD, zap_icon),
-    ("2", "TUG OF WAR  (2P)", C_P2, trophy_icon),
-    ("3", "HOW TO PLAY", C_P1, rocket_idle),
-    ("4", "SETTINGS", C_DIM, skull_icon),
-]
+class Scene:
+    overlay = False
+
+    def __init__(self, app):
+        self.app = app
+
+    def handle(self, e):
+        pass
+
+    def update(self, dt):
+        pass
+
+    def draw(self, s):
+        pass
+
+    def on_blur(self):
+        pass
 
 
-def draw_menu_card(surf, cx, cy, w, h, hot, icon, label, key, color, t):
-    x, y = cx - w // 2, cy - h // 2
-    bg = (40, 36, 72) if hot else (28, 25, 52)
-    pygame.draw.rect(surf, bg, (x, y, w, h))
-    border = color if hot else C_VERY_DIM
-    pygame.draw.rect(surf, border, (x, y, w, h), 2)
-    if hot:
-        g = int(40 + 30 * math.sin(t * 6))
-        glow = pygame.Surface((w + 8, h + 8), pygame.SRCALPHA)
-        glow.fill((*color[:3], g))
-        surf.blit(glow, (x - 4, y - 4), special_flags=pygame.BLEND_PREMULTIPLIED)
-    iy = y + (h - icon.get_height()) // 2
-    bob = int(math.sin(t * 3 + cy) * 2)
-    surf.blit(icon, (x + 10, iy + bob))
-    draw_text_shadow(surf, label, font_small,
-                     C_WHITE if hot else C_DIM, x + 34, cy - 6, center=False)
-    kx = x + w - 12
-    pygame.draw.rect(surf, (18, 16, 34), (kx - 12, cy - 8, 14, 16))
-    pygame.draw.rect(surf, border, (kx - 12, cy - 8, 14, 16), 1)
-    draw_text(surf, key, font_tiny, C_WHITE if hot else C_DIM, kx - 5, cy)
+class Overlay(Scene):
+    """Modal panel: title, optional stars, text lines and key-driven options.
+    options = [(keys, key_label, text, callback), ...]"""
+    overlay = True
+
+    def __init__(self, app, title, color, lines=(), options=(), stars=None):
+        super().__init__(app)
+        self.title, self.color, self.lines = title, color, list(lines)
+        self.options, self.stars = list(options), stars
+        self.t = 0.0
+        self.shown = 0
+        self.shade = pygame.Surface((W, H), pygame.SRCALPHA)
+        self.shade.fill(INK + (150,))
+
+    def update(self, dt):
+        self.t += dt
+        if self.stars is not None:
+            n = sum(1 for i in range(self.stars) if self.t > 0.3 + 0.25 * i)
+            if n > self.shown:
+                self.shown = n
+                self.app.audio.play("perfect" if n == 3 else "good")
+
+    def handle(self, e):
+        if e.type == pygame.KEYDOWN and self.t > 0.25:
+            for keys, _label, _text, fn in self.options:
+                if e.key in keys:
+                    self.app.audio.play("confirm")
+                    fn()
+                    return
+
+    def draw(self, s):
+        s.blit(self.shade, (0, 0))
+        h = 32 + (28 if self.stars is not None else 0) + len(self.lines) * 11 + 8 + len(self.options) * 12 + 6
+        w = 236
+        x, y = (W - w) // 2, (H - h) // 2
+        panel(s, (x, y, w, h))
+        cy = y + 9
+        draw_text(s, self.title, W // 2, cy, self.color, 2, "center")
+        cy += 24
+        if self.stars is not None:
+            for i in range(3):
+                sx = W // 2 - 31 + i * 22
+                if i < self.stars and self.t > 0.3 + 0.25 * i:
+                    k = self.t - (0.3 + 0.25 * i)
+                    bump = -int(4 * max(0.0, 1 - k * 6)) if k < 0.17 else 0
+                    s.blit(big_icon("star"), (sx, cy + bump))
+                else:
+                    s.blit(big_icon("star", empty=True), (sx, cy))
+            cy += 28
+        for text, col in self.lines:
+            draw_text(s, text, W // 2, cy, col, 1, "center")
+            cy += 11
+        cy += 8
+        for _keys, label, text, _fn in self.options:
+            draw_text(s, f"[{label}] {text}", W // 2, cy, STEEL, 1, "center")
+            cy += 12
 
 
-# ======================================================================
-# MAIN GAME LOOP
-# ======================================================================
-def main():
-    state = "MENU"
-    mode = 1
+def make_pause(app, restart):
+    opts = [((pygame.K_p, pygame.K_ESCAPE, pygame.K_RETURN), "P", "RESUME", app.pop),
+            ((pygame.K_r,), "R", "RESTART", restart),
+            ((pygame.K_q,), "Q", "QUIT TO MENU", lambda: app.pop(2))]
+    return Overlay(app, "PAUSED", WHITE, [("CATCH YOUR BREATH, HERO", STEEL)], opts)
 
-    save_data = load_save()
-    highest_unlocked_level = save_data["highest_unlocked_level"]
-    total_stars = save_data["stars"]
-    highscores = save_data["highscores"]          # {level_str: best_score}
-    level_stars = save_data.get("level_stars", {})  # {level_str: stars 0-3}
 
-    career_level = 1
-    selected_level_cursor = min(highest_unlocked_level, 1)
-    page = (selected_level_cursor - 1) // 10
+# --------------------------------------------------------------------------
+#  TITLE
+# --------------------------------------------------------------------------
+class TitleScene(Scene):
+    ITEMS = ["CAMPAIGN", "SURVIVAL", "VERSUS 2P", "HOW TO PLAY", "SETTINGS", "QUIT"]
 
-    current_level_data = generate_career_level(1)
-    game_duration = current_level_data["time_limit"]
-    time_left = game_duration
+    def __init__(self, app):
+        super().__init__(app)
+        self.sel = 0
+        self.t = 0.0
+        self.theme = random.randrange(5)
+        self.bg = get_bg(self.theme)
+        self.amb = Ambient(self.theme)
+        self.shade = pygame.Surface((W, H), pygame.SRCALPHA)
+        self.shade.fill(INK + (90,))
 
-    tug_balance = 0
-    tug_winner = None
-    tournament_mode = False
-    p1_wins = 0
-    p2_wins = 0
-    round_number = 1
+    def update(self, dt):
+        self.t += dt
+        self.amb.update(dt)
 
-    selected_setting_idx = 0
-    menu_hot_idx = 0
-
-    particles = []
-    popups = []
-    shake_time = 0.0
-    shake_mag = 0.0
-    t_global = 0.0
-    countdown = 0.0
-    new_star_award = 0
-    confetti_timer = 0.0
-
-    # fever background flash helper
-    def any_fever():
-        return (p1 is not None and p1.fever_active) or \
-               (mode == 2 and p2 is not None and p2.fever_active)
-
-    def make_players():
-        idle1, flame1 = rocket_idle, rocket_flame
-        idle2, flame2 = rocket_p2_idle, rocket_p2_flame
-        b1 = PlayerBar(PX_W // 2 - BAR_W // 2, C_P1, C_P1_DARK, "p1",
-                       idle1, flame1,
-                       cursor_speed=current_level_data["cursor_speed"],
-                       target_height=current_level_data["target_height"])
-        b2 = PlayerBar(PX_W - 90 - BAR_W, C_P2, C_P2_DARK, "p2",
-                       idle2, flame2)
-        return b1, b2
-
-    p1, p2 = make_players()
-
-    def reset_round():
-        nonlocal time_left, p1, p2, tug_balance, tug_winner, game_duration
-        nonlocal current_level_data, particles, popups, countdown
-        particles = []
-        popups = []
-        if mode == 1:
-            current_level_data = generate_career_level(career_level)
-            game_duration = current_level_data["time_limit"]
-            p1, _ = make_players()
-            p2 = None
+    def activate(self, i):
+        a = self.app
+        a.audio.play("confirm")
+        if i == 0:
+            a.push(LevelSelectScene(a))
+        elif i == 1:
+            a.push(BattleScene(a, "survival", 1))
+        elif i == 2:
+            a.push(VersusScene(a))
+        elif i == 3:
+            a.push(HowToScene(a))
+        elif i == 4:
+            a.push(SettingsScene(a))
         else:
-            game_duration = 30.0
-            _, p2 = make_players()
-            p1, _ = make_players()
-            p1.px = 60
-            p2.px = PX_W - 60 - BAR_W
-            p1.base_speed = p2.base_speed = 170
-            p1.cursor_speed = p2.cursor_speed = 170
-            p1.target_h = p2.target_h = 40
-            p1.randomize_target()
-            p2.randomize_target()
-        time_left = game_duration
-        tug_balance = 0
-        tug_winner = None
-        countdown = 3.0
+            a.running = False
 
-    def reset_full_game(selected_mode):
-        nonlocal mode, p1_wins, p2_wins, round_number
-        mode = selected_mode
-        p1_wins = 0
-        p2_wins = 0
-        round_number = 1
-        reset_round()
+    def handle(self, e):
+        if e.type != pygame.KEYDOWN:
+            return
+        n = len(self.ITEMS)
+        if e.key in (pygame.K_UP, pygame.K_w):
+            self.sel = (self.sel - 1) % n
+            self.app.audio.play("select")
+        elif e.key in (pygame.K_DOWN, pygame.K_s):
+            self.sel = (self.sel + 1) % n
+            self.app.audio.play("select")
+        elif e.key in (pygame.K_RETURN, pygame.K_SPACE):
+            self.activate(self.sel)
+        elif pygame.K_1 <= e.key <= pygame.K_6:
+            self.sel = e.key - pygame.K_1
+            self.activate(self.sel)
+        elif e.key == pygame.K_ESCAPE:
+            self.app.running = False
 
-    def add_shake(mag, dur):
-        nonlocal shake_mag, shake_time
-        if SETTINGS["screen_shake"]:
-            shake_mag = max(shake_mag, mag)
-            shake_time = max(shake_time, dur)
+    def draw(self, s):
+        s.blit(self.bg, (0, 0))
+        self.amb.draw(s, self.app.cfg["particles"])
+        s.blit(self.shade, (0, 0))
+        bob = int(round(math.sin(self.t * 2.2) * 2))
+        draw_text(s, "TIMING", W // 2, 10 + bob, YELLOW, 5, "center", BROWN)
+        draw_text(s, "CLASH", W // 2, 52 - bob, WHITE, 5, "center", RED)
+        # the two rivals
+        hb = 1 if math.sin(self.t * 5) > 0 else 0
+        s.blit(pygame.transform.scale(hero_sprite(0), (32, 32)), (34, 98 - hb))
+        draw_shadow(s, 50, 132, 30)
+        slime = enemy_sprite("slime", 0.0)
+        s.blit(pygame.transform.scale(slime, (32, 32)), (254, 98 + hb))
+        draw_shadow(s, 270, 132, 30)
+        # menu
+        for i, item in enumerate(self.ITEMS):
+            y = 92 + i * 12
+            if i == self.sel:
+                label = f"> {item} <" if int(self.t * 3) % 2 == 0 else f"  {item}  "
+                draw_text(s, label, W // 2, y, YELLOW, 1, "center")
+            else:
+                draw_text(s, item, W // 2, y, WHITE, 1, "center")
+        sv = self.app.save
+        draw_text(s, f"LEVEL {sv.highest}", 6, 172, STEEL)
+        draw_text(s, f"BEST WAVE {sv.survival_wave}", W - 6, 172, STEEL, 1, "right")
+        draw_text(s, "ARROWS + ENTER", W // 2, 172, STEEL, 1, "center")
 
-    def _menu_activate(idx):
-        """Activate a main-menu card by index (0..3)."""
-        nonlocal state, selected_level_cursor, page
-        if idx == 0:
-            selected_level_cursor = highest_unlocked_level
-            page = (selected_level_cursor - 1) // 10
-            state = "LEVEL_SELECT"
-        elif idx == 1:
-            reset_full_game(2)
-            state = "GAME"
-        elif idx == 2:
-            state = "CONTROLS"
+
+# --------------------------------------------------------------------------
+#  LEVEL SELECT
+# --------------------------------------------------------------------------
+class LevelSelectScene(Scene):
+    def __init__(self, app):
+        super().__init__(app)
+        self.cur = app.save.highest
+        self.t = 0.0
+        self.shade = pygame.Surface((W, H), pygame.SRCALPHA)
+        self.shade.fill(INK + (175,))
+
+    def update(self, dt):
+        self.t += dt
+
+    def handle(self, e):
+        if e.type != pygame.KEYDOWN:
+            return
+        hi = self.app.save.highest
+        old = self.cur
+        if e.key == pygame.K_LEFT:
+            self.cur -= 1
+        elif e.key == pygame.K_RIGHT:
+            self.cur += 1
+        elif e.key == pygame.K_UP:
+            self.cur -= 5
+        elif e.key == pygame.K_DOWN:
+            self.cur += 5
+        elif e.key in (pygame.K_RETURN, pygame.K_SPACE):
+            self.app.audio.play("confirm")
+            self.app.push(BattleScene(self.app, "campaign", self.cur))
+            return
+        elif e.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+            self.app.audio.play("back")
+            self.app.pop()
+            return
+        self.cur = max(1, min(hi, self.cur))
+        if self.cur != old:
+            self.app.audio.play("select")
+
+    def draw(self, s):
+        sv = self.app.save
+        self.cur = max(1, min(sv.highest, self.cur))
+        cur_lv = make_level(self.cur)
+        s.blit(get_bg(cur_lv["theme"]), (0, 0))
+        s.blit(self.shade, (0, 0))
+        draw_text(s, "SELECT LEVEL", W // 2, 5, YELLOW, 2, "center")
+        draw_text(s, f"WORLD {cur_lv['theme'] + 1} - {WORLD_NAMES[cur_lv['theme']]}", W // 2, 24, STEEL, 1, "center")
+        page = (self.cur - 1) // 10
+        for i in range(10):
+            n = page * 10 + i + 1
+            col, row = i % 5, i // 5
+            x, y = 5 + col * 63, 36 + row * 49
+            lv = make_level(n)
+            unlocked = n <= sv.highest
+            selected = n == self.cur
+            pygame.draw.rect(s, INK, (x, y, 58, 44))
+            if selected:
+                border = YELLOW if int(self.t * 4) % 2 == 0 else ORANGE
+            elif lv["boss"]:
+                border = RED
+            else:
+                border = STEEL if unlocked else CHAR
+            pygame.draw.rect(s, border, (x + 1, y + 1, 56, 42))
+            pygame.draw.rect(s, NAVY if unlocked else INK, (x + 2, y + 2, 54, 40))
+            if unlocked:
+                spr = enemy_sprite(lv["kind"], lv["hue"])
+                s.blit(spr, (x + 21, y + 4))
+                draw_text(s, str(n), x + 29, y + 22, WHITE if not lv["boss"] else RED, 1, "center")
+                got = sv.star_count(n)
+                for k in range(3):
+                    s.blit(icon("star", empty=k >= got), (x + 14 + k * 10, y + 31))
+            else:
+                s.blit(icon("lock"), (x + 25, y + 10))
+                draw_text(s, str(n), x + 29, y + 26, CHAR, 1, "center")
+        panel(s, (5, 134, 310, 34))
+        draw_text(s, f"LEVEL {self.cur}: {cur_lv['name']}", 12, 139, RED if cur_lv["boss"] else YELLOW)
+        draw_text(s, f"HP {cur_lv['hp']}  SPEED {cur_lv['speed']:.2f}  ZONE {int(cur_lv['zone'] * 100)}%", 12, 149, WHITE)
+        traits = ", ".join(MOD_TEXT[m] for m in cur_lv["mods"]) or "NO TRICKS - JUST TIMING"
+        draw_text(s, traits, 12, 158, CYAN)
+        draw_text(s, "ARROWS: PICK   ENTER: FIGHT   ESC: BACK", W // 2, 171, STEEL, 1, "center")
+
+
+# --------------------------------------------------------------------------
+#  HOW TO PLAY
+# --------------------------------------------------------------------------
+class HowToScene(Scene):
+    def __init__(self, app):
+        super().__init__(app)
+        self.page = 0
+        self.t = 0.0
+        self.bar = TimingBar(24, 34, 100, YELLOW)
+        self.bar.configure(0.55, 0.3, [], 0.5)
+        self.bar.zone_c = 0.5
+        self.shade = pygame.Surface((W, H), pygame.SRCALPHA)
+        self.shade.fill(INK + (170,))
+
+    def update(self, dt):
+        self.t += dt
+        self.bar.update(dt)
+        self.bar.zone_c = 0.5
+
+    def handle(self, e):
+        if e.type != pygame.KEYDOWN:
+            return
+        if e.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+            self.app.audio.play("back")
+            self.app.pop()
+        elif e.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_SPACE, pygame.K_RETURN):
+            self.page = 1 - self.page
+            self.app.audio.play("select")
+
+    def draw(self, s):
+        s.blit(get_bg(2), (0, 0))
+        s.blit(self.shade, (0, 0))
+        draw_text(s, "HOW TO PLAY", W // 2, 6, YELLOW, 2, "center")
+        if self.page == 0:
+            b = self.bar
+            b.draw(s)
+            zc = b.top + int(b.zone_c * b.h)
+            for label, y, col in (("PERFECT 2X", zc, YELLOW), ("GOOD 1X", zc - int(b.zone * b.h * 0.42), GREEN),
+                                  ("MISS", zc + int(b.zone * b.h) + 6, RED)):
+                pygame.draw.rect(s, col, (b.x + 26, y, 10, 1))
+                draw_text(s, label, b.x + 40, y - 3, col)
+            lines = [
+                ("1. WATCH THE LINE BOUNCE", WHITE), ("2. HIT SPACE IN THE GREEN", WHITE),
+                ("   GOLD CENTRE = PERFECT", YELLOW), ("3. HITS HURT THE ENEMY", WHITE),
+                ("4. MISSES FILL ITS RAGE", WHITE), ("   FULL RAGE = LOSE A HEART", RED),
+                ("5. 5 HIT STREAK = POWER", WHITE), ("   STRIKE AND HEAL", CYAN),
+                ("", WHITE), ("P1: SPACE / A / CLICK", BLUE), ("P2: L", RED),
+                ("P PAUSE  F11 SCREEN  M MUTE", STEEL),
+            ]
+            for i, (t, c) in enumerate(lines):
+                draw_text(s, t, 148, 32 + i * 11, c)
         else:
-            state = "SETTINGS"
+            draw_text(s, "EVERY ENEMY HAS A TRICK", W // 2, 26, WHITE, 1, "center")
+            for i, e in enumerate(ENEMIES):
+                col, row = i % 2, i // 2
+                x, y = 16 + col * 156, 42 + row * 38
+                panel(s, (x, y - 4, 148, 34))
+                bob = 1 if math.sin(self.t * 5 + i) > 0 else 0
+                s.blit(enemy_sprite(e["kind"]), (x + 6, y - bob))
+                draw_text(s, e["name"], x + 28, y + 1, YELLOW)
+                trait = MOD_TEXT[e["mods"][0]] if e["mods"] else "NO TRICKS"
+                draw_text(s, trait, x + 28, y + 12, CYAN)
+            draw_text(s, "EVERY 5TH LEVEL IS A BOSS WITH EXTRA TRICKS", W // 2, 158, RED, 1, "center")
+        draw_text(s, f"< PAGE {self.page + 1}/2 >   ESC: BACK", W // 2, 171, STEEL, 1, "center")
 
-    def handle_hit(bar):
-        """Common reaction to a scored attempt."""
-        cx_px = bar.px + BAR_W // 2
-        cy_px = bar.target_y + bar.target_h // 2
-        res = bar.attempt_score()
-        if res in ("PERFECT", "GOOD"):
-            mult = 1 + (bar.streak - 1) // 3
-            if bar.fever_active:
-                mult *= 2
-            pts = (2 if res == "PERFECT" else 1) * mult
-            popups.append(Popup(f"+{pts}", cx_px + 24, cy_px,
-                                C_GOLD if res == "PERFECT" else C_GREEN,
-                                big=(res == "PERFECT")))
-            if res == "PERFECT":
-                popups.append(Popup("PERFECT!", cx_px, cy_px - 14, C_GOLD))
-                sound.play("perfect")
-                spawn_burst(particles, cx_px, cy_px,
-                            [C_GOLD, C_WHITE, C_FEVER_B], n=26, spread=200)
-                add_shake(3, 0.15)
-            else:
-                sound.play("hit")
-                spawn_burst(particles, cx_px, cy_px,
-                            [bar.color, C_WHITE], n=14, spread=140)
-            if bar.streak > 0 and bar.streak % 5 == 0:
-                popups.append(Popup(f"{bar.streak} STREAK!", cx_px,
-                                    cy_px - 28, C_FEVER_A, big=True))
-                sound.play("coin")
-                add_shake(4, 0.2)
-            if bar.fever_time > 0 and bar.fever_time > 4.8:
-                popups.append(Popup("FEVER!!", WIDTH // 4, HEIGHT // 4,
-                                    C_FEVER_B, big=True))
-                sound.play("fever")
-                add_shake(5, 0.35)
-        elif res == "MISS":
-            sound.play("miss")
-            spawn_burst(particles, cx_px, int(bar.cursor_y),
-                        [C_RED, (120, 40, 40)], n=12, spread=120)
-            add_shake(6, 0.3)
-        return res
 
-    # ------------------------------------------------------------------
-    while True:
-        dt = clock.tick(FPS) / 1000.0
-        dt = min(dt, 0.05)
-        t_global += dt
-        mx, my = pygame.mouse.get_pos()
+# --------------------------------------------------------------------------
+#  SETTINGS
+# --------------------------------------------------------------------------
+class SettingsScene(Scene):
+    ITEMS = [
+        ("difficulty", "DIFFICULTY", [0, 1, 2], lambda v: DIFFICULTY[v]["name"],
+         "HEARTS, LOCK TIME AND ENEMY RAGE SPEED"),
+        ("music", "MUSIC", [False, True], None, "CHIPTUNE BACKGROUND LOOP"),
+        ("sfx", "SOUND FX", [False, True], None, "HITS, MISSES AND JINGLES"),
+        ("shake", "SCREEN SHAKE", [False, True], None, "CAMERA KICK ON IMPACTS"),
+        ("particles", "PARTICLES", [False, True], None, "SPARKS, EMBERS AND DUST"),
+        ("show_fps", "FPS COUNTER", [False, True], None, "SHOW FRAMES PER SECOND"),
+        ("vs_rounds", "VERSUS MATCH", [1, 3, 5], lambda v: f"BEST OF {v}", "ROUNDS NEEDED IN 2 PLAYER MODE"),
+        ("fullscreen", "FULLSCREEN", [False, True], None, "ALSO F11 ANYWHERE"),
+        ("reset", "RESET PROGRESS", None, None, "ERASE LEVELS, STARS AND HIGH SCORES"),
+    ]
 
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                sys.exit()
+    def __init__(self, app):
+        super().__init__(app)
+        self.sel = 0
+        self.confirm = False
+        self.t = 0.0
+        self.shade = pygame.Surface((W, H), pygame.SRCALPHA)
+        self.shade.fill(INK + (170,))
 
-            if event.type == pygame.KEYDOWN:
-                key = event.key
-                # -------- MENU --------
-                if state == "MENU":
-                    if key in (pygame.K_UP, pygame.K_w):
-                        menu_hot_idx = (menu_hot_idx - 1) % len(MENU_ITEMS)
-                        sound.play("back")
-                    elif key in (pygame.K_DOWN, pygame.K_s):
-                        menu_hot_idx = (menu_hot_idx + 1) % len(MENU_ITEMS)
-                        sound.play("select")
-                    elif key in (pygame.K_RETURN, pygame.K_SPACE):
-                        # activate the highlighted card via shared handler
-                        _menu_activate(menu_hot_idx)
-                        sound.play("select")
-                    elif key == pygame.K_1:
-                        selected_level_cursor = highest_unlocked_level
-                        page = (selected_level_cursor - 1) // 10
-                        state = "LEVEL_SELECT"
-                        sound.play("select")
-                    elif key == pygame.K_2:
-                        reset_full_game(2)
-                        state = "GAME"
-                        sound.play("select")
-                    elif key == pygame.K_3:
-                        state = "CONTROLS"
-                        sound.play("select")
-                    elif key == pygame.K_4:
-                        state = "SETTINGS"
-                        sound.play("select")
-                    elif key == pygame.K_t:
-                        tournament_mode = not tournament_mode
-                        sound.play("select")
-                    elif key == pygame.K_ESCAPE:
-                        pygame.quit()
-                        sys.exit()
+    def update(self, dt):
+        self.t += dt
 
-                # -------- LEVEL SELECT --------
-                elif state == "LEVEL_SELECT":
-                    if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
-                        sound.play("back")
-                        state = "MENU"
-                    elif key == pygame.K_LEFT:
-                        selected_level_cursor = max(1, selected_level_cursor - 1)
-                        sound.play("back")
-                    elif key == pygame.K_RIGHT:
-                        selected_level_cursor = min(highest_unlocked_level,
-                                                    selected_level_cursor + 1)
-                        sound.play("select")
-                    elif key == pygame.K_UP:
-                        selected_level_cursor = max(1, selected_level_cursor - 5)
-                        sound.play("back")
-                    elif key == pygame.K_DOWN:
-                        selected_level_cursor = min(highest_unlocked_level,
-                                                    selected_level_cursor + 5)
-                        sound.play("select")
-                    elif key in (pygame.K_SPACE, pygame.K_RETURN):
-                        sound.play("select")
-                        career_level = selected_level_cursor
-                        reset_full_game(1)
-                        state = "GAME"
-                    page = (selected_level_cursor - 1) // 10
-
-                # -------- SETTINGS --------
-                elif state == "SETTINGS":
-                    if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
-                        sound.play("back")
-                        state = "MENU"
-                    elif key == pygame.K_UP:
-                        selected_setting_idx = (selected_setting_idx - 1) % len(SETTING_KEYS)
-                        sound.play("back")
-                    elif key == pygame.K_DOWN:
-                        selected_setting_idx = (selected_setting_idx + 1) % len(SETTING_KEYS)
-                        sound.play("select")
-                    elif key in (pygame.K_SPACE, pygame.K_RETURN):
-                        k = SETTING_KEYS[selected_setting_idx]
-                        SETTINGS[k] = not SETTINGS[k]
-                        if k == "sound":
-                            sound.enabled = SETTINGS["sound"] and sound.mixer_ok
-                        sound.play("select")
-
-                # -------- CONTROLS --------
-                elif state == "CONTROLS":
-                    if key in (pygame.K_ESCAPE, pygame.K_SPACE, pygame.K_RETURN):
-                        sound.play("back")
-                        state = "MENU"
-
-                # -------- IN-GAME --------
-                elif state == "GAME":
-                    if countdown > 0:
-                        continue
-                    if key == pygame.K_a or key == pygame.K_SPACE:
-                        if mode == 1 or True:
-                            res = handle_hit(p1)
-                            if mode == 2 and res in ("PERFECT", "GOOD"):
-                                power = 1 + (p1.streak // 3)
-                                if p1.fever_active:
-                                    power += 1
-                                tug_balance -= power
-                    if mode == 2 and key == pygame.K_l:
-                        res = handle_hit(p2)
-                        if res in ("PERFECT", "GOOD"):
-                            power = 1 + (p2.streak // 3)
-                            if p2.fever_active:
-                                power += 1
-                            tug_balance += power
-                    if key == pygame.K_ESCAPE:
-                        sound.play("back")
-                        state = "MENU"
-
-                # -------- RESULT SCREENS --------
-                elif state in ("LEVEL_CLEAR", "ROUND_OVER", "GAMEOVER",
-                               "TOURNAMENT_OVER", "NEW RECORD"):
-                    if key in (pygame.K_SPACE, pygame.K_RETURN):
-                        sound.play("select")
-                        if state == "LEVEL_CLEAR" or state == "NEW RECORD":
-                            career_level += 1
-                            if career_level > highest_unlocked_level:
-                                highest_unlocked_level = career_level
-                            reset_round()
-                            state = "GAME"
-                        elif state == "ROUND_OVER":
-                            round_number += 1
-                            reset_round()
-                            state = "GAME"
-                        else:
-                            reset_full_game(mode)
-                            state = "GAME"
-                    elif key == pygame.K_ESCAPE:
-                        sound.play("back")
-                        state = "MENU"
-
-        # ------------------------------------------------------------------
-        # UPDATE
-        # ------------------------------------------------------------------
-        for p in particles[:]:
-            p.update(dt)
-            if p.life <= 0:
-                particles.remove(p)
-        for pu in popups[:]:
-            pu.update(dt)
-            if pu.life <= 0:
-                popups.remove(pu)
-        if shake_time > 0:
-            shake_time -= dt
-            if shake_time <= 0:
-                shake_mag = 0
-
-        if state == "GAME":
-            if countdown > 0:
-                countdown -= dt
-            else:
-                time_left -= dt
-                p1.update(dt)
-                p1.update_timers(dt)
-                if mode == 2 and p2:
-                    p2.update(dt)
-                    p2.update_timers(dt)
-
-                round_ended = False
-                if mode == 1:
-                    if p1.lives <= 0:
-                        sound.play("crash")
-                        add_shake(8, 0.5)
-                        spawn_burst(particles, p1.px + BAR_W // 2,
-                                    int(p1.cursor_y),
-                                    [C_RED, C_GOLD, C_WHITE], n=40, spread=240)
-                        state = "GAMEOVER"
-                        sound.play("lose")
-                    elif time_left <= 0:
-                        time_left = 0
-                        if p1.score >= current_level_data["target_score"]:
-                            state = "LEVEL_CLEAR"
-                        else:
-                            state = "GAMEOVER"
-                            sound.play("lose")
-                    elif p1.score >= current_level_data["target_score"]:
-                        # level cleared!
-                        st = stars_for(current_level_data, p1)
-                        prev_best = int(highscores.get(str(career_level), 0))
-                        new_record = p1.score > prev_best
-                        highscores[str(career_level)] = max(prev_best, p1.score)
-                        if career_level == highest_unlocked_level:
-                            highest_unlocked_level = min(LEVEL_COUNT,
-                                                         career_level + 1)
-                        key = str(career_level)
-                        prev_stars = int(level_stars.get(key, 0))
-                        if st > prev_stars:
-                            total_stars += st - prev_stars
-                            level_stars[key] = st
-                        save_data = {
-                            "highest_unlocked_level": highest_unlocked_level,
-                            "stars": total_stars,
-                            "highscores": highscores,
-                            "level_stars": level_stars,
-                        }
-                        write_save(save_data)
-                        sound.play("win")
-                        confetti_timer = 1.2
-                        state = "NEW RECORD" if new_record else "LEVEL_CLEAR"
+    def change(self, d):
+        key, _label, values, _fmt, _desc = self.ITEMS[self.sel]
+        a = self.app
+        if key == "reset":
+            if d > 0 or d == 0:
+                if self.confirm:
+                    a.save.reset()
+                    self.confirm = False
+                    a.audio.play("ko")
                 else:
-                    KO_TARGET = 12
-                    if tug_balance <= -KO_TARGET:
-                        tug_winner = "P1 KNOCKOUT!"
-                        round_ended = True
-                    elif tug_balance >= KO_TARGET:
-                        tug_winner = "P2 KNOCKOUT!"
-                        round_ended = True
-                    elif p1.lives <= 0 or p2.lives <= 0:
-                        tug_winner = ("P2 WINS - P1 DOWN!" if p1.lives <= 0
-                                      else "P1 WINS - P2 DOWN!")
-                        round_ended = True
-                    elif time_left <= 0:
-                        time_left = 0
-                        round_ended = True
+                    self.confirm = True
+                    a.audio.play("select")
+            return
+        cur = a.cfg[key]
+        idx = values.index(cur) if cur in values else 0
+        a.cfg[key] = values[(idx + (d or 1)) % len(values)]
+        if key == "music":
+            a.audio.set_music(a.cfg["music"])
+        elif key == "fullscreen":
+            a.set_fullscreen(a.cfg["fullscreen"])
+        a.save.save()
+        a.audio.play("select")
 
-                    if round_ended:
-                        add_shake(8, 0.5)
-                        if tournament_mode:
-                            rw = None
-                            if tug_winner:
-                                rw = "p1" if tug_winner.startswith("P1") else "p2"
-                            elif tug_balance < 0:
-                                rw = "p1"
-                            elif tug_balance > 0:
-                                rw = "p2"
-                            if rw == "p1":
-                                p1_wins += 1
-                            elif rw == "p2":
-                                p2_wins += 1
-                            if p1_wins >= 2 or p2_wins >= 2:
-                                state = "TOURNAMENT_OVER"
-                                sound.play("win")
-                            else:
-                                state = "ROUND_OVER"
-                                sound.play("coin")
-                        else:
-                            state = "GAMEOVER"
-                            sound.play("win")
+    def handle(self, e):
+        if e.type != pygame.KEYDOWN:
+            return
+        n = len(self.ITEMS)
+        if e.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+            self.app.audio.play("back")
+            self.app.pop()
+        elif e.key in (pygame.K_UP, pygame.K_w):
+            self.sel = (self.sel - 1) % n
+            self.confirm = False
+            self.app.audio.play("select")
+        elif e.key in (pygame.K_DOWN, pygame.K_s):
+            self.sel = (self.sel + 1) % n
+            self.confirm = False
+            self.app.audio.play("select")
+        elif e.key in (pygame.K_LEFT, pygame.K_a):
+            self.change(-1)
+        elif e.key in (pygame.K_RIGHT, pygame.K_d, pygame.K_RETURN, pygame.K_SPACE):
+            self.change(1)
 
-        if confetti_timer > 0 and state in ("LEVEL_CLEAR", "NEW RECORD"):
-            confetti_timer -= dt
-            for _ in range(3):
-                particles.append(Particle(random.uniform(0, PX_W), -4,
-                                          random.choice([C_GOLD, C_P1, C_P2,
-                                                         C_GREEN, C_FEVER_A]),
-                                          vx=random.uniform(-30, 30),
-                                          vy=random.uniform(40, 120),
-                                          life=random.uniform(1.0, 2.0),
-                                          gravity=60))
-
-        # ------------------------------------------------------------------
-        # RENDER (everything into the low-res pixel buffer)
-        # ------------------------------------------------------------------
-        buffer.fill(C_BG_TOP)
-        draw_background(buffer, t_global, fever=any_fever() and state == "GAME")
-
-        if state == "MENU":
-            # big title with rocket
-            bob = int(math.sin(t_global * 2) * 4)
-            ti = font_large.render("TIMING CLASH", True, C_GOLD)
-            shadow = font_large.render("TIMING CLASH", True, (90, 60, 10))
-            tw = ti.get_width()
-            buffer.blit(shadow, (PX_W // 2 - tw // 2 + 2, 34 + bob // 2 + 2))
-            buffer.blit(ti, (PX_W // 2 - tw // 2, 34 + bob // 2))
-            buffer.blit(rocket_idle, (PX_W // 2 - tw // 2 - 20, 30 + bob))
-            buffer.blit(rocket_p2_idle, (PX_W // 2 + tw // 2 + 9, 30 - bob))
-            draw_text(buffer, "PIXEL ARCADE EDITION", font_tiny, C_P1,
-                      PX_W // 2, 68)
-
-            mouse_idx = -1
-            card_h, gap = 34, 8
-            start_y = 120
-            for i, (k, label, col, icon) in enumerate(MENU_ITEMS):
-                cy = start_y + i * (card_h + gap) + card_h // 2
-                hx = PX_W // 2
-                rect = pygame.Rect(hx - 110, cy - card_h // 2, 220, card_h)
-                if rect.collidepoint(mx // PIXEL_SCALE, my // PIXEL_SCALE):
-                    mouse_idx = i
-                hot = (i == menu_hot_idx) or (i == mouse_idx)
-                draw_menu_card(buffer, hx, cy, 220, card_h, hot, icon,
-                               label, k, col, t_global)
-            menu_hot_idx = mouse_idx if mouse_idx >= 0 else menu_hot_idx
-
-            # footer stats
-            draw_text(buffer, f"TOTAL STARS: {total_stars}", font_tiny,
-                      C_GOLD, PX_W // 2 - 90, PX_H - 46)
-            best_any = max([int(v) for v in highscores.values()] or [0])
-            draw_text(buffer, f"BEST SCORE: {best_any}", font_tiny,
-                      C_P1, PX_W // 2 + 90, PX_H - 46)
-            t_stat = "ON" if tournament_mode else "OFF"
-            draw_text(buffer, f"[T] BEST OF 3: {t_stat}", font_tiny,
-                      C_GREEN if tournament_mode else C_DIM,
-                      PX_W // 2, PX_H - 28)
-            draw_text(buffer, "ARROWS + ENTER  |  or press number keys",
-                      font_tiny, C_DIM, PX_W // 2, PX_H - 12)
-
-        elif state == "LEVEL_SELECT":
-            draw_text_shadow(buffer, "SELECT MISSION", font_medium, C_GOLD,
-                             PX_W // 2, 20)
-            draw_text(buffer, f"STARS: {total_stars}   LEVELS: "
-                              f"{highest_unlocked_level}/{LEVEL_COUNT}",
-                      font_tiny, C_DIM, PX_W // 2, 40)
-
-            grid_cols, box_w, box_h = 5, 62, 44
-            gx0 = PX_W // 2 - (grid_cols * box_w + (grid_cols - 1) * 6) // 2
-            gy0 = 58
-            page_first = page * 10 + 1
-            for slot in range(10):
-                lvl = page_first + slot
-                col_i, row_i = slot % grid_cols, slot // grid_cols
-                bx = gx0 + col_i * (box_w + 6)
-                by = gy0 + row_i * (box_h + 6)
-                unlocked = lvl <= highest_unlocked_level
-                sel = lvl == selected_level_cursor
-                if unlocked:
-                    st = int(level_stars.get(str(lvl), 0))
-                    bgc = (52, 44, 92) if sel else (32, 28, 58)
-                    pygame.draw.rect(buffer, bgc, (bx, by, box_w, box_h))
-                    bc = C_GOLD if sel else C_VERY_DIM
-                    pygame.draw.rect(buffer, bc, (bx, by, box_w, box_h),
-                                     2 if sel else 1)
-                    draw_text(buffer, str(lvl), font_small,
-                              C_WHITE if sel else C_DIM,
-                              bx + box_w // 2, by + 12)
-                    sx = bx + box_w // 2 - (st * 7) - 1
-                    for si in range(3):
-                        icon = star_on if si < st else star_off
-                        blit_col = (sx + si * 9, by + box_h - 14)
-                        if unlocked:
-                            buffer.blit(icon, blit_col)
-                else:
-                    pygame.draw.rect(buffer, (22, 20, 38), (bx, by, box_w, box_h))
-                    pygame.draw.rect(buffer, (40, 38, 60), (bx, by, box_w, box_h), 1)
-                    buffer.blit(skull_icon, (bx + box_w // 2 - 3, by + box_h // 2 - 4))
-
-            # info panel
-            pv = generate_career_level(selected_level_cursor)
-            if selected_level_cursor <= highest_unlocked_level:
-                best = int(highscores.get(str(selected_level_cursor), 0))
-                info = (f"GOAL {pv['target_score']} PTS   TIME {int(pv['time_limit'])}s"
-                        f"   SPEED {pv['cursor_speed']}   BEST {best}")
-                draw_text(buffer, info, font_tiny, C_P1, PX_W // 2, PX_H - 40)
+    def draw(self, s):
+        s.blit(get_bg(1), (0, 0))
+        s.blit(self.shade, (0, 0))
+        draw_text(s, "SETTINGS", W // 2, 6, YELLOW, 2, "center")
+        for i, (key, label, _values, fmt, _desc) in enumerate(self.ITEMS):
+            y = 28 + i * 14
+            sel = i == self.sel
+            if sel:
+                pygame.draw.rect(s, NAVY, (30, y - 3, 260, 12))
+                pygame.draw.rect(s, STEEL, (30, y - 3, 260, 12), 1)
+            draw_text(s, label, 40, y, YELLOW if sel else WHITE)
+            if key == "reset":
+                txt = "PRESS AGAIN TO CONFIRM" if (sel and self.confirm) else "[ ERASE ]"
+                col = RED
             else:
-                draw_text(buffer, "LOCKED - CLEAR PREVIOUS MISSIONS",
-                          font_tiny, C_RED, PX_W // 2, PX_H - 40)
-            draw_text(buffer, "<- Arrows navigate | SPACE launch | ESC back | A/D page",
-                      font_tiny, C_DIM, PX_W // 2, PX_H - 20)
-            draw_text(buffer, f"PAGE {page + 1}/3", font_tiny, C_GOLD,
-                      PX_W - 40, 20)
+                v = self.app.cfg[key]
+                txt = fmt(v) if fmt else ("ON" if v else "OFF")
+                col = (GREEN if v else RED) if fmt is None else CYAN
+            draw_text(s, f"< {txt} >" if sel and key != "reset" else txt, 280, y, col, 1, "right")
+        draw_text(s, self.ITEMS[self.sel][4], W // 2, 156, STEEL, 1, "center")
+        draw_text(s, "UP/DOWN: SELECT  LEFT/RIGHT: CHANGE  ESC: BACK", W // 2, 171, STEEL, 1, "center")
 
-        elif state == "SETTINGS":
-            draw_text_shadow(buffer, "SETTINGS", font_medium, C_GOLD,
-                             PX_W // 2, 30)
-            for i, k in enumerate(SETTING_KEYS):
-                yy = 70 + i * 26
-                sel = i == selected_setting_idx
-                col = C_WHITE if sel else C_DIM
-                pre = "> " if sel else "  "
-                draw_text(buffer, f"{pre}{SETTING_LABELS[k]}", font_small,
-                          col, PX_W // 2 - 110, yy, center=False)
-                vc = C_GREEN if SETTINGS[k] else C_RED
-                draw_text(buffer, "[ ON ]" if SETTINGS[k] else "[ OFF ]",
-                          font_small, vc, PX_W // 2 + 110, yy)
-            draw_text(buffer, "UP/DOWN move | SPACE toggle | ESC back",
-                      font_tiny, C_DIM, PX_W // 2, PX_H - 30)
 
-        elif state == "CONTROLS":
-            draw_text_shadow(buffer, "HOW TO PLAY", font_medium, C_GOLD,
-                             PX_W // 2, 24)
-            rowy = 60
-            draw_text(buffer, "LAND THE ROCKET INSIDE THE GLOWING TARGET ZONE",
-                      font_tiny, C_WHITE, PX_W // 2, rowy)
-            rowy += 18
-            draw_text(buffer, "CENTER OF THE ZONE = PERFECT = DOUBLE POINTS",
-                      font_tiny, C_GOLD, PX_W // 2, rowy)
-            rowy += 18
-            draw_text(buffer, "CHAIN HITS FOR STREAKS  x2  x3  x4 ...",
-                      font_tiny, C_GREEN, PX_W // 2, rowy)
-            rowy += 18
-            buffer.blit(zap_icon, (PX_W // 2 - 60, rowy - 6))
-            draw_text(buffer, "FILL THE COMBO METER TO TRIGGER FEVER MODE (2x PTS!)",
-                      font_tiny, C_FEVER_B, PX_W // 2 + 12, rowy)
-            rowy += 20
-            buffer.blit(heart_full, (PX_W // 2 - 78, rowy - 6))
-            draw_text(buffer, "A MISS COSTS ONE LIFE AND FREEZES YOUR ROCKET",
-                      font_tiny, C_RED, PX_W // 2 + 14, rowy)
-            rowy += 24
-            # keycaps
-            buffer.blit(keycap_blue, (PX_W // 2 - 100, rowy))
-            draw_text(buffer, "= PLAYER 1 / SOLO", font_tiny, C_P1,
-                      PX_W // 2 + 10, rowy + 7)
-            rowy += 20
-            buffer.blit(keycap_red, (PX_W // 2 - 100, rowy))
-            draw_text(buffer, "= PLAYER 2 (TUG OF WAR)", font_tiny, C_P2,
-                      PX_W // 2 + 24, rowy + 7)
-            rowy += 26
-            draw_text(buffer, "SPACE also works for solo timing. Press ESC/SPACE to return",
-                      font_tiny, C_DIM, PX_W // 2, PX_H - 30)
+# --------------------------------------------------------------------------
+#  BATTLE  (campaign + survival)
+# --------------------------------------------------------------------------
+class BattleScene(Scene):
+    HERO_X = 60
+    ENEMY_CX = 244
+    INTRO_T = 1.9
+    ATK_T = 0.55
 
-        elif state == "GAME":
-            # HUD
-            if mode == 1:
-                lv = current_level_data
-                draw_text_shadow(buffer, lv["title"], font_small, C_GOLD,
-                                 PX_W // 2, 12)
-                # goal progress bar
-                goal_frac = min(1.0, p1.score / max(1, lv["target_score"]))
-                gw = 160
-                gx = PX_W // 2 - gw // 2
-                pygame.draw.rect(buffer, (30, 26, 55), (gx, 22, gw, 8))
-                fillc = C_GREEN if goal_frac >= 1 else C_P1
-                pygame.draw.rect(buffer, fillc, (gx, 22, int(gw * goal_frac), 8))
-                pygame.draw.rect(buffer, C_VERY_DIM, (gx, 22, gw, 8), 1)
-                draw_text(buffer, f"{p1.score}/{lv['target_score']}", font_tiny,
-                          C_WHITE, PX_W // 2, 36)
+    def __init__(self, app, mode="campaign", level=1):
+        super().__init__(app)
+        self.mode, self.level = mode, level
+        self.diff = DIFFICULTY[app.cfg["difficulty"]]
+        self.max_hearts = self.diff["hearts"]
+        self.hearts = self.max_hearts
+        self.score = 0
+        self.fx = FX(app)
+        self.bar = TimingBar(W // 2 - 8)
+        self.hitstop = 0.0
+        self.hero_atk = self.hero_hurt = self.en_hurt = self.en_atk = 0.0
+        self.en_hit_done = True
+        self.clock_t = 0.0
+        self.tutorial = mode == "campaign" and level == 1
+        self.dim = pygame.Surface((W, 64), pygame.SRCALPHA)
+        self.dim.fill(INK + (175,))
+        self.setup_enemy()
 
-                # timer
-                tc = C_RED if time_left < 5 else C_WHITE
-                draw_text_shadow(buffer, f"{math.ceil(time_left)}", font_medium,
-                                 tc, PX_W - 34, 16)
-                draw_text(buffer, "SEC", font_tiny, C_DIM, PX_W - 34, 34)
+    # ---- setup -----------------------------------------------------------
+    def setup_enemy(self):
+        lv = make_level(self.level)
+        self.lv = lv
+        self.hp = self.hp_max = lv["hp"]
+        self.bar.configure(lv["speed"], lv["zone"], lv["mods"], self.diff["lock"])
+        self.gauge = 0.0
+        self.gauge_time = lv["gauge_time"] * self.diff["gauge"]
+        self.scale = 2 if lv["boss"] else 1
+        self.sprite = enemy_sprite(lv["kind"], lv["hue"], self.scale)
+        self.bg = get_bg(lv["theme"])
+        self.amb = Ambient(lv["theme"])
+        self.phase, self.t = "intro", 0.0
+        self.go_played = False
+        self.combo = 0
+        self.stat = {"perfect": 0, "good": 0, "miss": 0, "lost": 0, "maxcombo": 0}
+        self.en_atk = 0.0
+        self.en_hit_done = True
 
-                # lives (hearts, top-left)
-                for li in range(3):
-                    icon = heart_full if li < p1.lives else heart_empty
-                    buffer.blit(icon, (10 + li * 11, 10))
+    def enemy_center(self):
+        return self.ENEMY_CX, GROUND - 8 * self.scale
 
-                # streak + fever meter (left column)
-                if p1.streak >= 2:
-                    mult = 1 + p1.streak // 3
-                    draw_text_shadow(buffer, f"x{mult}", font_small,
-                                     C_FEVER_A, 24, 40)
-                    draw_text(buffer, f"{p1.streak} STRK", font_tiny, C_DIM,
-                              24, 52)
-                # fever meter vertical, right of bar
-                fx = p1.px + BAR_W + 6
-                fh = BAR_H
-                pygame.draw.rect(buffer, (30, 26, 55), (fx, BAR_Y, 5, fh))
-                fill_h = int(fh * (1.0 if p1.fever_time > 0 else p1.fever))
-                fc = C_FEVER_B if p1.fever_time > 0 else C_GOLD
-                pygame.draw.rect(buffer, fc,
-                                 (fx, BAR_Y + fh - fill_h, 5, fill_h))
-                pygame.draw.rect(buffer, C_VERY_DIM, (fx, BAR_Y, 5, fh), 1)
-                if int(t_global * 6) % 2 == 0 and p1.fever_time > 0:
-                    draw_text(buffer, "FEVER!", font_tiny, C_FEVER_A,
-                              fx + 2, BAR_Y - 8)
-                else:
-                    draw_text(buffer, "ZAP", font_tiny, C_DIM, fx + 2, BAR_Y - 8)
+    # ---- input -----------------------------------------------------------
+    def handle(self, e):
+        if e.type == pygame.KEYDOWN:
+            if e.key in (pygame.K_SPACE, pygame.K_a):
+                self.strike()
+            elif e.key in (pygame.K_p, pygame.K_ESCAPE):
+                self.pause()
+        elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+            self.strike()
 
-                p1.draw(buffer, particles, popups, t_global)
+    def on_blur(self):
+        self.pause()
 
+    def pause(self):
+        if self.phase in ("intro", "play"):
+            self.app.audio.play("select")
+            self.app.push(make_pause(self.app, self.restart))
+
+    def restart(self):
+        a = self.app
+        a.pop(2)
+        a.push(BattleScene(a, self.mode, 1 if self.mode == "survival" else self.level))
+
+    # ---- combat ----------------------------------------------------------
+    def strike(self):
+        if self.phase == "intro":
+            if self.t > 0.5:
+                self.t = self.INTRO_T
+            return
+        if self.phase != "play":
+            return
+        r = self.bar.press()
+        a = self.app
+        if r is None:
+            a.audio.play("locked")
+            return
+        bx = self.bar.x + 8
+        if r in ("good", "perfect"):
+            perfect = r == "perfect"
+            self.combo += 1
+            self.stat["perfect" if perfect else "good"] += 1
+            self.stat["maxcombo"] = max(self.stat["maxcombo"], self.combo)
+            dmg = 2 if perfect else 1
+            power = self.combo % 5 == 0
+            if power:
+                dmg += 1
+            self.score += (150 if perfect else 100) + 10 * self.combo
+            self.hero_atk = 0.2
+            ex, ey = self.enemy_center()
+            self.fx.shot(self.HERO_X + 14, GROUND - 10, ex - 6 * self.scale, ey, 520,
+                         YELLOW if perfect else CYAN, lambda: self.impact(dmg, perfect, power))
+            self.fx.text("PERFECT!" if perfect else "GOOD", bx, self.bar.cursor_y() - 6,
+                         YELLOW if perfect else GREEN)
+            a.audio.play("perfect" if perfect else "good")
+            self.tutorial = False
+        else:
+            self.combo = 0
+            self.stat["miss"] += 1
+            self.gauge = min(1.0, self.gauge + 0.22)
+            a.audio.play("miss")
+            a.shake(2, 0.12)
+            self.fx.text("TRAP!" if r == "decoy" else "MISS", bx, self.bar.cursor_y() - 6, RED)
+            self.fx.burst(bx, self.bar.cursor_y(), RED, 6, 50, 0.3)
+            if r == "decoy":
+                self.hurt_hero()
+
+    def impact(self, dmg, perfect, power):
+        if self.phase != "play":
+            return
+        a = self.app
+        ex, ey = self.enemy_center()
+        self.hp = max(0, self.hp - dmg)
+        self.en_hurt = 0.3
+        self.gauge = max(0.0, self.gauge - (0.30 if perfect else 0.18))
+        self.hitstop = 0.09 if perfect else 0.05
+        self.fx.burst(ex, ey, YELLOW if perfect else CYAN, 8 + 4 * dmg, 110)
+        self.fx.text(f"-{dmg}", ex, ey - 10 * self.scale - 8, WHITE, 2)
+        a.shake(1 + dmg, 0.16)
+        a.audio.play("thud")
+        if power:
+            self.fx.text("POWER STRIKE!", W // 2, 22, ORANGE, 1, 1.1)
+            a.audio.play("power")
+            a.flash_screen(WHITE, 70, 0.15)
+            self.heal()
+        if self.hp <= 0:
+            self.begin_win()
+
+    def heal(self):
+        if self.hearts < self.max_hearts:
+            self.hearts += 1
+            self.fx.text("+1", self.HERO_X + 8, GROUND - 30, GREEN, 2)
+            self.app.audio.play("heal")
+
+    def hurt_hero(self):
+        if self.phase != "play":
+            return
+        self.hearts -= 1
+        self.stat["lost"] += 1
+        self.combo = 0
+        self.hero_hurt = 0.5
+        self.gauge = 0.12
+        hx = self.HERO_X + 8
+        self.fx.burst(hx, GROUND - 8, RED, 14, 100)
+        self.fx.text("-1", hx, GROUND - 32, RED, 2)
+        self.app.audio.play("hurt")
+        self.app.shake(5, 0.3)
+        self.app.flash_screen(RED, 100, 0.22)
+        if self.hearts <= 0:
+            self.begin_lose()
+
+    def begin_win(self):
+        self.phase, self.t = "win", -0.1
+        ex, ey = self.enemy_center()
+        self.fx.burst(ex, ey, WHITE, 30, 160, 0.8)
+        self.fx.burst(ex, ey, YELLOW, 20, 120, 0.8)
+        self.app.audio.play("ko")
+        self.app.shake(6, 0.35)
+
+    def begin_lose(self):
+        self.phase, self.t = "lose", 0.0
+        self.en_atk = 0.0
+        self.app.audio.play("lose")
+
+    def finish_win(self):
+        a = self.app
+        if self.mode == "campaign":
+            lost = self.stat["lost"]
+            stars = 3 if lost == 0 else (2 if lost <= 2 else 1)
+            self.score += 500 + self.hearts * 100 + stars * 200
+            a.save.record_level(self.level, stars)
+            lines = [(f"SCORE {self.score}", WHITE), (f"BEST COMBO {self.stat['maxcombo']}", CYAN),
+                     (f"HEARTS LOST {lost}", GREEN if lost == 0 else RED),
+                     (f"LEVEL {self.level + 1} UNLOCKED", YELLOW)]
+            opts = [((pygame.K_SPACE, pygame.K_RETURN), "SPACE", "NEXT LEVEL", lambda: self.go_level(self.level + 1)),
+                    ((pygame.K_r,), "R", "RETRY", lambda: self.go_level(self.level)),
+                    ((pygame.K_ESCAPE,), "ESC", "LEVEL SELECT", lambda: a.pop(2))]
+            self.phase = "done"
+            a.audio.play("win")
+            a.push(Overlay(a, "BOSS DOWN!" if self.lv["boss"] else "LEVEL CLEAR!", GREEN, lines, opts, stars))
+        else:
+            self.score += 300 + self.level * 40 + (150 if self.stat["lost"] == 0 else 0)
+            self.level += 1
+            a.save.survival_wave = max(a.save.survival_wave, self.level - 1)
+            self.fx.text("WAVE CLEAR!", W // 2, 70, GREEN, 2, 1.2)
+            self.heal()
+            self.setup_enemy()
+            self.t = -0.4
+
+    def finish_lose(self):
+        a = self.app
+        self.phase = "done"
+        if self.mode == "campaign":
+            lines = [(f"ENEMY HP LEFT {self.hp}/{self.hp_max}", WHITE), (f"SCORE {self.score}", STEEL)]
+            opts = [((pygame.K_SPACE, pygame.K_RETURN, pygame.K_r), "SPACE", "TRY AGAIN", lambda: self.go_level(self.level)),
+                    ((pygame.K_ESCAPE,), "ESC", "LEVEL SELECT", lambda: a.pop(2))]
+            a.push(Overlay(a, "DEFEATED", RED, lines, opts))
+        else:
+            sv = a.save
+            new_best = self.score > sv.survival_best
+            sv.survival_best = max(sv.survival_best, self.score)
+            sv.survival_wave = max(sv.survival_wave, self.level)
+            sv.save()
+            lines = [(f"REACHED WAVE {self.level}", WHITE), (f"SCORE {self.score}", YELLOW),
+                     ("NEW HIGH SCORE!" if new_best else f"BEST {sv.survival_best}", GREEN if new_best else STEEL)]
+            opts = [((pygame.K_SPACE, pygame.K_RETURN, pygame.K_r), "SPACE", "RUN AGAIN", self.restart),
+                    ((pygame.K_ESCAPE,), "ESC", "MENU", lambda: a.pop(2))]
+            a.push(Overlay(a, "GAME OVER", RED, lines, opts))
+
+    def go_level(self, n):
+        a = self.app
+        a.pop(2)
+        a.push(BattleScene(a, "campaign", n))
+
+    # ---- update ----------------------------------------------------------
+    def update(self, dt):
+        if self.hitstop > 0:
+            self.hitstop -= dt
+            dt = 0.0
+        self.clock_t += dt
+        self.fx.update(dt)
+        self.amb.update(dt)
+        self.hero_atk = max(0.0, self.hero_atk - dt)
+        self.hero_hurt = max(0.0, self.hero_hurt - dt)
+        self.en_hurt = max(0.0, self.en_hurt - dt)
+        if self.phase == "intro":
+            self.t += dt
+            if not self.go_played and self.t > 1.1:
+                self.go_played = True
+                self.app.audio.play("go")
+            if self.t >= self.INTRO_T:
+                self.phase = "play"
+        elif self.phase == "play":
+            self.bar.update(dt)
+            if self.en_atk > 0:
+                self.en_atk -= dt
+                if not self.en_hit_done and self.en_atk <= 0.25:
+                    self.en_hit_done = True
+                    self.hurt_hero()
             else:
-                # ---- TUG OF WAR ----
-                draw_text_shadow(buffer, "TUG OF WAR", font_small, C_GOLD,
-                                 PX_W // 2, 12)
-                if tournament_mode:
-                    draw_text(buffer, f"ROUND {round_number}   "
-                                      f"P1 {p1_wins} - {p2_wins} P2",
-                              font_tiny, C_DIM, PX_W // 2, 26)
-                tc = C_RED if time_left < 5 else C_WHITE
-                draw_text_shadow(buffer, f"{math.ceil(time_left)}", font_medium,
-                                 tc, PX_W // 2, 40)
+                self.gauge += dt / self.gauge_time
+                if self.gauge >= 1.0:
+                    self.gauge = 1.0
+                    self.en_atk = self.ATK_T
+                    self.en_hit_done = False
+                    self.app.audio.play("rage")
+        elif self.phase == "win":
+            self.t += dt
+            if 0 < self.t < 0.7 and random.random() < 0.3:
+                ex, ey = self.enemy_center()
+                self.fx.burst(ex + random.randint(-8, 8) * self.scale, ey + random.randint(-8, 8) * self.scale,
+                              random.choice((WHITE, YELLOW, ORANGE)), 6, 90)
+            if self.t >= 1.3:
+                self.finish_win()
+        elif self.phase == "lose":
+            self.t += dt
+            if self.t >= 1.7:
+                self.finish_lose()
 
-                # rope + flag
-                rope_y = PX_H // 2 + 60
-                pygame.draw.line(buffer, (150, 110, 60),
-                                 (30, rope_y), (PX_W - 30, rope_y), 2)
-                for nx in range(34, PX_W - 30, 8):
-                    pygame.draw.line(buffer, (110, 80, 45),
-                                     (nx, rope_y - 2), (nx, rope_y + 2))
-                flag_x = PX_W // 2 + int(tug_balance * 6.5)
-                pygame.draw.rect(buffer, C_WHITE, (flag_x - 1, rope_y - 12, 2, 24))
-                pygame.draw.polygon(buffer, C_GOLD,
-                                    [(flag_x + 1, rope_y - 12),
-                                     (flag_x + 11, rope_y - 8),
-                                     (flag_x + 1, rope_y - 4)])
-                # win zones
-                pygame.draw.rect(buffer, (*C_P1[:3],), (30, rope_y - 6, 14, 12))
-                pygame.draw.rect(buffer, C_P2, (PX_W - 44, rope_y - 6, 14, 12))
+    # ---- drawing ---------------------------------------------------------
+    def draw_hero(self, s):
+        x = self.HERO_X
+        if self.hero_atk > 0:
+            x += int(10 * math.sin(math.pi * (1 - self.hero_atk / 0.2)))
+        if self.hero_hurt > 0:
+            x -= int(4 * math.sin(math.pi * (1 - self.hero_hurt / 0.5)))
+        draw_shadow(s, x + 8, GROUND, 18)
+        spr = hero_sprite(0)
+        if self.phase == "lose" and self.t > 0.2:
+            img = pygame.transform.rotate(spr, -90)
+            blit_char(s, img, x, GROUND)
+            return
+        flash = WHITE if self.hero_hurt > 0 and int(self.hero_hurt * 30) % 2 == 0 else None
+        bob = 1 if math.sin(self.clock_t * 5) > 0 else 0
+        blit_char(s, spr, x, GROUND - bob, flash)
 
-                # per-player HUD
-                for bar, xoff, colr, tag in ((p1, 10, C_P1, "P1"),
-                                             (p2, PX_W - 10, C_P2, "P2")):
-                    if bar is None:
-                        continue
-                    draw_text_shadow(buffer, f"{tag}: {bar.score}", font_small,
-                                     colr, xoff + (0 if tag == 'P1' else 0), 40)
-                    for li in range(3):
-                        icon = heart_full if li < bar.lives else heart_empty
-                        if tag == "P1":
-                            buffer.blit(icon, (xoff + li * 11, 52))
-                        else:
-                            buffer.blit(icon, (xoff - 9 - li * 11, 52))
-                    # mini fever bar
-                    fxm = xoff if tag == "P1" else xoff - 40
-                    pygame.draw.rect(buffer, (30, 26, 55), (fxm, 64, 40, 4))
-                    ffill = int(40 * (1.0 if bar.fever_time > 0 else bar.fever))
-                    pygame.draw.rect(buffer,
-                                     C_FEVER_B if bar.fever_time > 0 else C_GOLD,
-                                     (fxm, 64, ffill, 4))
-                    if bar.streak >= 2:
-                        draw_text(buffer, f"x{1 + bar.streak // 3}", font_tiny,
-                                  C_FEVER_A, fxm + 20, 76)
+    def draw_enemy(self, s):
+        sz = 16 * self.scale
+        left = self.ENEMY_CX - sz // 2
+        feet = GROUND
+        kind = self.lv["kind"]
+        alpha = 255
+        if self.phase == "intro":
+            left += int(max(0.0, 1 - self.t / 0.7) ** 2 * 90)
+        if self.en_atk > 0:
+            p = 1 - self.en_atk / self.ATK_T
+            left -= int(48 * math.sin(math.pi * min(1.0, p)))
+        if self.en_hurt > 0:
+            left += int(math.sin(self.clock_t * 70) * 2)
+        if kind in ("bat", "ghost"):
+            feet -= 8 * self.scale // 2 + int(2 * math.sin(self.clock_t * 3))
+        else:
+            feet -= 1 if math.sin(self.clock_t * 4) > 0 else 0
+        draw_shadow(s, self.ENEMY_CX, GROUND, sz + 4)
+        if kind == "ghost":
+            alpha = 215
+        flash = None
+        if self.en_hurt > 0.18:
+            flash = WHITE
+        elif self.phase == "play" and self.gauge > 0.8 and int(self.clock_t * 10) % 4 == 0:
+            flash = RED
+        if self.phase == "win":
+            if self.t > 0.9:
+                return
+            if self.t > 0 and int(self.t * 25) % 2 == 0:
+                return
+            flash = WHITE
+        blit_char(s, self.sprite, left, feet, flash, alpha)
 
-                p1.draw(buffer, particles, popups, t_global)
-                if p2:
-                    p2.draw(buffer, particles, popups, t_global)
+    def draw_hud(self, s):
+        for i in range(self.max_hearts):
+            s.blit(icon("heart", empty=i >= self.hearts), (6 + i * 10, 4))
+        draw_text(s, f"{self.score:07d}", 7, 16, YELLOW)
+        label = f"WAVE {self.level}" if self.mode == "survival" else f"LEVEL {self.level}"
+        draw_text(s, label, W // 2, 4, WHITE, 1, "center")
+        draw_text(s, self.lv["name"], W - 6, 4, RED if self.lv["boss"] else WHITE, 1, "right")
+        bar_gauge(s, W - 6 - 110, 14, 110, 7, self.hp / self.hp_max, RED, WINE, ORANGE)
+        for i in range(1, self.hp_max):
+            x = W - 6 - 110 + (110 * i) // self.hp_max
+            pygame.draw.rect(s, INK, (x, 14, 1, 7))
+        if self.combo >= 2:
+            draw_text(s, f"COMBO x{self.combo}", W // 2, 15, ORANGE if self.combo >= 5 else WHITE, 1, "center")
+        # rage meter below the enemy, key hint below the hero
+        ex = self.ENEMY_CX
+        hot = self.gauge > 0.8 and int(self.clock_t * 8) % 2 == 0
+        bar_gauge(s, ex - 22, 160, 44, 5, self.gauge, RED if hot else ORANGE, CHAR, YELLOW)
+        draw_text(s, "RAGE", ex, 167, RED if hot else STEEL, 1, "center")
+        keycap(s, "SPACE", self.HERO_X + 8, 158)
 
-            # particles & popups on top
-            if SETTINGS["particles"]:
-                for p in particles:
-                    p.draw(buffer)
-            for pu in popups:
-                pu.draw(buffer)
+    def draw_banner(self, s):
+        if self.phase == "intro":
+            if self.t < 1.1:
+                s.blit(self.dim, (0, 50))
+                lv = self.lv
+                draw_text(s, WORLD_NAMES[lv["theme"]], W // 2, 55, STEEL, 1, "center")
+                head = ("WAVE %d" if self.mode == "survival" else "LEVEL %d") % self.level
+                draw_text(s, head, W // 2, 65, YELLOW, 3, "center")
+                draw_text(s, ("BOSS: " if lv["boss"] else "") + lv["name"], W // 2, 92, RED if lv["boss"] else WHITE, 1, "center")
+                trait = ", ".join(MOD_TEXT[m] for m in lv["mods"]) or "NO TRICKS"
+                draw_text(s, trait, W // 2, 104, CYAN, 1, "center")
+            elif int(self.t * 10) % 2 == 0 or self.t > 1.5:
+                draw_text(s, "FIGHT!", W // 2, 68, ORANGE, 4, "center", INK)
+        elif self.phase == "play" and self.tutorial and self.stat["perfect"] + self.stat["good"] == 0:
+            if int(self.clock_t * 2) % 2 == 0:
+                draw_text(s, "PRESS SPACE WHEN THE LINE IS IN THE GREEN ZONE", W // 2, 140, WHITE, 1, "center")
+        elif self.phase == "win" and self.t > 0.5:
+            draw_text(s, "VICTORY!", W // 2, 68, YELLOW, 3, "center")
+        elif self.phase == "lose" and self.t > 0.5:
+            draw_text(s, "DEFEATED", W // 2, 68, RED, 3, "center")
 
-            if SETTINGS["show_fps"]:
-                draw_text(buffer, f"{int(clock.get_fps())} FPS", font_tiny,
-                          C_GREEN, PX_W - 30, PX_H - 10)
+    def draw(self, s):
+        s.blit(self.bg, (0, 0))
+        self.amb.draw(s, self.app.cfg["particles"])
+        self.bar.draw(s)
+        self.draw_enemy(s)
+        self.draw_hero(s)
+        self.fx.draw(s)
+        self.draw_hud(s)
+        self.draw_banner(s)
 
-            # countdown overlay
-            if countdown > 0:
-                n = math.ceil(countdown)
-                txt = str(n) if n > 0 else "GO!"
-                draw_text_shadow(buffer, txt, font_giant,
-                                 C_GOLD if n <= 0 else C_WHITE,
-                                 PX_W // 2, PX_H // 2)
 
-        elif state in ("LEVEL_CLEAR", "NEW RECORD", "GAMEOVER", "ROUND_OVER",
-                       "TOURNAMENT_OVER"):
-            # keep last frame dimmed behind
-            ov = pygame.Surface((PX_W, PX_H), pygame.SRCALPHA)
-            ov.fill((10, 8, 24, 190))
-            buffer.blit(ov, (0, 0))
+# --------------------------------------------------------------------------
+#  VERSUS  (local 2-player duel)
+# --------------------------------------------------------------------------
+class VersusScene(Scene):
+    BAR_X = (100, 204)
+    HERO_X = (28, 276)
+    MAX_HP = 10
+    ROUND_MODS = [[], ["flip"], ["drift"], ["erratic"], ["blink"]]
 
-            if SETTINGS["particles"]:
-                for p in particles:
-                    p.draw(buffer)
+    def __init__(self, app):
+        super().__init__(app)
+        self.need = app.cfg["vs_rounds"] // 2 + 1
+        self.wins = [0, 0]
+        self.round = 1
+        self.fx = FX(app)
+        self.keys = (pygame.K_a, pygame.K_l)
+        self.clock_t = 0.0
+        self.start_round()
 
-            if state in ("LEVEL_CLEAR", "NEW RECORD"):
-                buffer.blit(trophy_icon, (PX_W // 2 - 5, 60))
-                draw_text_shadow(buffer, "MISSION COMPLETE!", font_large,
-                                 C_GREEN, PX_W // 2, 110)
-                if state == "NEW RECORD":
-                    if int(t_global * 4) % 2 == 0:
-                        draw_text_shadow(buffer, "* NEW RECORD *", font_medium,
-                                         C_FEVER_A, PX_W // 2, 145)
-                st = stars_for(current_level_data, p1)
-                for si in range(3):
-                    icon = star_on if si < st else star_off
-                    buffer.blit(icon, (PX_W // 2 - 16 + si * 12, 160))
-                draw_text(buffer, f"SCORE {p1.score}   PERFECTS {p1.perfects}"
-                                  f"   BEST STREAK {p1.best_streak}",
-                          font_tiny, C_WHITE, PX_W // 2, 196)
-                draw_text(buffer, f"NEXT: LEVEL {min(career_level + 1, LEVEL_COUNT)} UNLOCKED",
-                          font_tiny, C_GOLD, PX_W // 2, 214)
-                draw_text(buffer, "SPACE: Next Level   |   ESC: Menu",
-                          font_tiny, C_DIM, PX_W // 2, PX_H - 30)
+    def start_round(self):
+        self.hp = [self.MAX_HP, self.MAX_HP]
+        self.combo = [0, 0]
+        self.bars = [TimingBar(self.BAR_X[0], color=BLUE), TimingBar(self.BAR_X[1], color=RED)]
+        mods = self.ROUND_MODS[(self.round - 1) % len(self.ROUND_MODS)]
+        for b in self.bars:
+            b.configure(0.8, 0.28, mods, 0.8)
+        self.mods = mods
+        self.phase, self.t = "intro", 3.0
+        self.count_shown = 4
+        self.fight_t = 0.0
+        self.elapsed, self.rage = 0.0, 0
+        self.hurt = [0.0, 0.0]
+        self.atk = [0.0, 0.0]
+        self.theme = (self.round - 1) % 5
+        self.bg = get_bg(self.theme)
+        self.amb = Ambient(self.theme)
 
-            elif state == "TOURNAMENT_OVER":
-                buffer.blit(trophy_icon, (PX_W // 2 - 5, 60))
-                champ = "PLAYER 1" if p1_wins > p2_wins else "PLAYER 2"
-                cc = C_P1 if p1_wins > p2_wins else C_P2
-                draw_text_shadow(buffer, "CHAMPION!", font_large, C_GOLD,
-                                 PX_W // 2, 110)
-                draw_text_shadow(buffer, f"{champ} TAKES THE CROWN", font_medium,
-                                 cc, PX_W // 2, 150)
-                draw_text(buffer, f"FINAL  {p1_wins} - {p2_wins}", font_small,
-                          C_WHITE, PX_W // 2, 185)
-                draw_text(buffer, "SPACE: Rematch   |   ESC: Menu", font_tiny,
-                          C_DIM, PX_W // 2, PX_H - 30)
+    def handle(self, e):
+        if e.type != pygame.KEYDOWN:
+            return
+        if e.key == self.keys[0]:
+            self.press(0)
+        elif e.key == self.keys[1]:
+            self.press(1)
+        elif e.key in (pygame.K_p, pygame.K_ESCAPE):
+            self.pause()
 
-            elif state == "ROUND_OVER":
-                winner_txt = tug_winner if tug_winner else (
-                    "P1 TAKES THE ROUND" if tug_balance < 0 else
-                    "P2 TAKES THE ROUND" if tug_balance > 0 else " DEAD HEAT!")
-                wc = C_P1 if "P1" in winner_txt else C_P2 if "P2" in winner_txt else C_WHITE
-                draw_text_shadow(buffer, f"ROUND {round_number} OVER", font_large,
-                                 C_WHITE, PX_W // 2, 110)
-                draw_text_shadow(buffer, winner_txt, font_medium, wc,
-                                 PX_W // 2, 155)
-                draw_text(buffer, f"SERIES  P1 {p1_wins} - {p2_wins} P2",
-                          font_small, C_GOLD, PX_W // 2, 190)
-                draw_text(buffer, "SPACE: Next Round   |   ESC: Menu", font_tiny,
-                          C_DIM, PX_W // 2, PX_H - 30)
+    def on_blur(self):
+        self.pause()
 
-            else:  # GAMEOVER
-                buffer.blit(skull_icon, (PX_W // 2 - 4, 60))
-                if mode == 1:
-                    reason = "ROCKET DESTROYED!" if p1.lives <= 0 else "TIME'S UP!"
-                    draw_text_shadow(buffer, "MISSION FAILED", font_large,
-                                     C_RED, PX_W // 2, 110)
-                    draw_text(buffer, reason, font_small, C_WHITE,
-                              PX_W // 2, 145)
-                    need = current_level_data["target_score"]
-                    draw_text(buffer, f"SCORE {p1.score} / {need} NEEDED",
-                              font_small, C_GOLD, PX_W // 2, 170)
+    def pause(self):
+        if self.phase in ("intro", "play"):
+            self.app.push(make_pause(self.app, self.restart))
+
+    def restart(self):
+        a = self.app
+        a.pop(2)
+        a.push(VersusScene(a))
+
+    def press(self, i):
+        if self.phase != "play":
+            return
+        b = self.bars[i]
+        r = b.press()
+        a = self.app
+        bx = b.x + 8
+        if r is None:
+            a.audio.play("locked")
+        elif r in ("good", "perfect"):
+            perfect = r == "perfect"
+            self.combo[i] += 1
+            dmg = 2 if perfect else 1
+            power = self.combo[i] % 5 == 0
+            if power:
+                dmg += 1
+            self.atk[i] = 0.2
+            sx = self.HERO_X[i] + (14 if i == 0 else 2)
+            tx = self.HERO_X[1 - i] + (4 if i == 0 else 12)
+            self.fx.shot(sx, GROUND - 10, tx, GROUND - 10, 560, YELLOW if perfect else (CYAN if i == 0 else ORANGE),
+                         lambda: self.deal(i, dmg, perfect, power))
+            self.fx.text("PERFECT!" if perfect else "GOOD", bx, b.cursor_y() - 6, YELLOW if perfect else GREEN)
+            a.audio.play("perfect" if perfect else "good")
+        else:
+            self.combo[i] = 0
+            self.fx.text("MISS", bx, b.cursor_y() - 6, RED)
+            a.audio.play("miss")
+            a.shake(2, 0.1)
+
+    def deal(self, i, dmg, perfect, power):
+        if self.phase != "play":
+            return
+        a = self.app
+        v = 1 - i
+        self.hp[v] = max(0, self.hp[v] - dmg)
+        self.hurt[v] = 0.4
+        vx = self.HERO_X[v] + 8
+        self.fx.burst(vx, GROUND - 8, YELLOW if perfect else (BLUE if i == 0 else RED), 8 + 4 * dmg, 110)
+        self.fx.text(f"-{dmg}", vx, GROUND - 32, WHITE, 2)
+        a.shake(1 + dmg, 0.15)
+        a.audio.play("thud")
+        if power:
+            self.fx.text("POWER STRIKE!", self.BAR_X[i] + 8, 22, ORANGE)
+            a.audio.play("power")
+            if self.hp[i] < self.MAX_HP:
+                self.hp[i] += 1
+        if self.hp[v] <= 0:
+            self.phase, self.t = "ko", 0.0
+            self.winner = i
+            self.wins[i] += 1
+            self.fx.burst(vx, GROUND - 8, WHITE, 30, 150, 0.8)
+            a.audio.play("ko")
+            a.shake(6, 0.4)
+            a.flash_screen(WHITE, 90, 0.2)
+
+    def update(self, dt):
+        self.clock_t += dt
+        self.fx.update(dt)
+        self.amb.update(dt)
+        for i in (0, 1):
+            self.hurt[i] = max(0.0, self.hurt[i] - dt)
+            self.atk[i] = max(0.0, self.atk[i] - dt)
+        self.fight_t = max(0.0, self.fight_t - dt)
+        if self.phase == "intro":
+            self.t -= dt
+            n = max(0, math.ceil(self.t))
+            if n != self.count_shown and n > 0:
+                self.count_shown = n
+                self.app.audio.play("tick")
+            if self.t <= 0:
+                self.phase = "play"
+                self.fight_t = 0.8
+                self.app.audio.play("go")
+        elif self.phase == "play":
+            for b in self.bars:
+                b.update(dt)
+            self.elapsed += dt
+            lv = int(self.elapsed / 8)
+            if lv > self.rage:
+                self.rage = lv
+                for b in self.bars:
+                    b.scale = min(1.6, 1 + 0.1 * lv)
+                self.fx.text("RAGE UP!", W // 2, 90, RED, 2, 1.0)
+                self.app.audio.play("rage")
+        elif self.phase == "ko":
+            self.t += dt
+            if self.t >= 2.0:
+                if max(self.wins) >= self.need:
+                    self.finish_match()
                 else:
-                    res = tug_winner or (
-                        "PLAYER 1 WINS!" if tug_balance < 0 else
-                        "PLAYER 2 WINS!" if tug_balance > 0 else "A PERFECT TIE!")
-                    rc = (C_P1 if "1" in res and "2" not in res else
-                          C_P2 if "2" in res else C_WHITE)
-                    draw_text_shadow(buffer, "MATCH OVER", font_large, C_WHITE,
-                                     PX_W // 2, 110)
-                    draw_text_shadow(buffer, res, font_medium, rc,
-                                     PX_W // 2, 155)
-                draw_text(buffer, "SPACE: Retry   |   ESC: Menu", font_tiny,
-                          C_DIM, PX_W // 2, PX_H - 30)
+                    self.round += 1
+                    self.start_round()
 
-        # ------------------------------------------------------------------
-        # BLIT BUFFER -> SCREEN (with screen shake, nearest-neighbour scaling)
-        # ------------------------------------------------------------------
-        ox = oy = 0
-        if SETTINGS["screen_shake"] and shake_time > 0:
-            ox = random.randint(-int(shake_mag), int(shake_mag))
-            oy = random.randint(-int(shake_mag), int(shake_mag))
-        scaled = pygame.transform.scale_by(buffer, PIXEL_SCALE)
-        screen.fill((0, 0, 0))
-        screen.blit(scaled, (ox, oy))
+    def finish_match(self):
+        a = self.app
+        self.phase = "done"
+        w = 0 if self.wins[0] > self.wins[1] else 1
+        lines = [(f"FINAL SCORE  {self.wins[0]} - {self.wins[1]}", WHITE)]
+        opts = [((pygame.K_SPACE, pygame.K_RETURN, pygame.K_r), "SPACE", "REMATCH", self.restart),
+                ((pygame.K_ESCAPE,), "ESC", "MENU", lambda: a.pop(2))]
+        a.audio.play("win")
+        a.push(Overlay(a, f"P{w + 1} WINS!", BLUE if w == 0 else RED, lines, opts))
+
+    # ---- drawing ---------------------------------------------------------
+    def draw_fighter(self, s, i):
+        spr = hero_sprite(i)
+        x = self.HERO_X[i]
+        d = 1 if i == 0 else -1
+        if self.atk[i] > 0:
+            x += d * int(10 * math.sin(math.pi * (1 - self.atk[i] / 0.2)))
+        if self.hurt[i] > 0:
+            x -= d * int(4 * math.sin(math.pi * (1 - self.hurt[i] / 0.4)))
+        draw_shadow(s, x + 8, GROUND, 18)
+        if self.phase in ("ko", "done") and self.hp[i] <= 0:
+            blit_char(s, pygame.transform.rotate(spr, -90 * d), x, GROUND)
+            return
+        flash = WHITE if self.hurt[i] > 0 and int(self.hurt[i] * 30) % 2 == 0 else None
+        bob = 1 if math.sin(self.clock_t * 5 + i) > 0 else 0
+        blit_char(s, spr, x, GROUND - bob, flash)
+
+    def draw_hud(self, s):
+        for i in (0, 1):
+            col = BLUE if i == 0 else RED
+            x = 8 if i == 0 else W - 8 - 104
+            pygame.draw.rect(s, INK, (x - 1, 8, 106, 9))
+            pygame.draw.rect(s, CHAR, (x, 9, 104, 7))
+            fw = int(104 * self.hp[i] / self.MAX_HP)
+            if fw > 0:
+                fx0 = x if i == 0 else x + 104 - fw
+                pygame.draw.rect(s, col, (fx0, 9, fw, 7))
+                pygame.draw.rect(s, WHITE, (fx0, 9, fw, 1))
+            for k in range(1, self.MAX_HP):
+                pygame.draw.rect(s, INK, (x + 104 * k // self.MAX_HP, 9, 1, 7))
+            draw_text(s, f"P{i + 1}", x if i == 0 else x + 104, 19, col, 1, "left" if i == 0 else "right")
+            for k in range(self.need):
+                px = (x + 18 + k * 8) if i == 0 else (x + 104 - 18 - k * 8 - 5)
+                pygame.draw.rect(s, INK, (px - 1, 19, 7, 7))
+                pygame.draw.rect(s, YELLOW if k < self.wins[i] else CHAR, (px, 20, 5, 5))
+        draw_text(s, f"ROUND {self.round}", W // 2, 8, WHITE, 1, "center")
+        draw_text(s, f"BEST OF {self.need * 2 - 1}", W // 2, 17, STEEL, 1, "center")
+        if self.rage and int(self.clock_t * 4) % 2 == 0:
+            draw_text(s, f"RAGE x{self.rage}", W // 2, 26, RED, 1, "center")
+        for i in (0, 1):
+            cx = self.BAR_X[i] + 8
+            keycap(s, "A" if i == 0 else "L", cx, 138, BLUE if i == 0 else RED)
+            if self.combo[i] >= 2:
+                draw_text(s, f"COMBO x{self.combo[i]}", cx, 152, ORANGE if self.combo[i] >= 5 else WHITE, 1, "center")
+        if self.mods:
+            draw_text(s, MOD_TEXT[self.mods[0]], W // 2, 160, CYAN, 1, "center")
+
+    def draw(self, s):
+        s.blit(self.bg, (0, 0))
+        self.amb.draw(s, self.app.cfg["particles"])
+        for b in self.bars:
+            b.draw(s)
+        draw_text(s, "VS", W // 2, 66, YELLOW, 3, "center")
+        self.draw_fighter(s, 0)
+        self.draw_fighter(s, 1)
+        self.fx.draw(s)
+        self.draw_hud(s)
+        if self.phase == "intro":
+            n = max(1, math.ceil(self.t))
+            draw_text(s, str(n), W // 2, 94, ORANGE, 5, "center")
+        elif self.fight_t > 0:
+            draw_text(s, "FIGHT!", W // 2, 94, ORANGE, 3, "center")
+        elif self.phase == "ko" and self.t > 0.4:
+            draw_text(s, f"P{self.winner + 1} WINS THE ROUND!", W // 2, 94, YELLOW, 1, "center")
+            draw_text(s, "K.O.!", W // 2, 106, RED, 3, "center")
+
+
+# --------------------------------------------------------------------------
+#  APP
+# --------------------------------------------------------------------------
+class App:
+    def __init__(self):
+        pygame.mixer.pre_init(RATE, -16, 1, 512)
+        pygame.init()
+        pygame.display.set_caption("Timing Clash")
+        self.save = SaveData()
+        self.cfg = self.save.settings
+        self.fullscreen = False
+        self.set_fullscreen(self.cfg["fullscreen"])
+        try:
+            pygame.display.set_icon(pygame.transform.scale(hero_sprite(0), (32, 32)))
+        except Exception:
+            pass
+        self.canvas = pygame.Surface((W, H))
+        self.clock = pygame.time.Clock()
+        self.audio = Audio(self)
+        self.scenes = []
+        self.running = True
+        self.shake_t = self.shake_mag = 0.0
+        self.flash = None
+        self.flash_surf = pygame.Surface((W, H), pygame.SRCALPHA)
+        self.push(TitleScene(self))
+
+    # ---- scene stack -----------------------------------------------------
+    def push(self, scene):
+        self.scenes.append(scene)
+
+    def pop(self, n=1):
+        for _ in range(n):
+            if self.scenes:
+                self.scenes.pop()
+
+    # ---- window / effects ------------------------------------------------
+    def set_fullscreen(self, on):
+        self.fullscreen = bool(on)
+        self.cfg["fullscreen"] = self.fullscreen
+        try:
+            if self.fullscreen:
+                self.win = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+            else:
+                self.win = pygame.display.set_mode((W * 4, H * 4), pygame.RESIZABLE)
+        except pygame.error:
+            self.fullscreen = False
+            self.cfg["fullscreen"] = False
+            self.win = pygame.display.set_mode((W * 4, H * 4), pygame.RESIZABLE)
+
+    def shake(self, mag, dur):
+        if self.cfg["shake"]:
+            self.shake_mag = max(self.shake_mag, mag)
+            self.shake_t = max(self.shake_t, dur)
+
+    def flash_screen(self, color, alpha, dur):
+        if self.cfg["shake"]:
+            self.flash = [color, alpha, dur, dur]
+
+    def present(self):
+        win = pygame.display.get_surface() or self.win
+        ww, wh = win.get_size()
+        sc = min(ww // W, wh // H)
+        if sc >= 1:
+            img = pygame.transform.scale(self.canvas, (W * sc, H * sc))
+        else:
+            f = min(ww / W, wh / H)
+            img = pygame.transform.scale(self.canvas, (max(1, int(W * f)), max(1, int(H * f))))
+            sc = 1
+        ox, oy = (ww - img.get_width()) // 2, (wh - img.get_height()) // 2
+        if self.shake_t > 0:
+            m = int(self.shake_mag)
+            ox += random.randint(-m, m) * sc
+            oy += random.randint(-m, m) * sc
+        win.fill(INK)
+        win.blit(img, (ox, oy))
         pygame.display.flip()
+
+    # ---- main loop -------------------------------------------------------
+    def run(self):
+        blur_event = getattr(pygame, "WINDOWFOCUSLOST", None)
+        while self.running and self.scenes:
+            dt = min(self.clock.tick(FPS) / 1000.0, 1 / 30)
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT:
+                    self.running = False
+                elif e.type == pygame.KEYDOWN and e.key == pygame.K_F11:
+                    self.set_fullscreen(not self.fullscreen)
+                    self.save.save()
+                elif e.type == pygame.KEYDOWN and e.key == pygame.K_m:
+                    self.audio.toggle_mute()
+                elif blur_event is not None and e.type == blur_event:
+                    if self.scenes:
+                        self.scenes[-1].on_blur()
+                elif self.scenes:
+                    self.scenes[-1].handle(e)
+            if not self.scenes:
+                break
+            self.scenes[-1].update(dt)
+            if self.shake_t > 0:
+                self.shake_t -= dt
+                if self.shake_t <= 0:
+                    self.shake_mag = 0.0
+            # draw: from the last non-overlay scene up to the top
+            base = len(self.scenes) - 1
+            while base > 0 and self.scenes[base].overlay:
+                base -= 1
+            for sc in self.scenes[base:]:
+                sc.draw(self.canvas)
+            if self.flash:
+                self.flash[3] -= dt
+                if self.flash[3] <= 0:
+                    self.flash = None
+                else:
+                    a = int(self.flash[1] * self.flash[3] / self.flash[2])
+                    self.flash_surf.fill(self.flash[0] + (a,))
+                    self.canvas.blit(self.flash_surf, (0, 0))
+            if self.cfg["show_fps"]:
+                draw_text(self.canvas, f"FPS {int(self.clock.get_fps())}", W - 4, H - 10, GREEN, 1, "right")
+            self.present()
+        self.save.save()
+        pygame.quit()
+
+
+def main():
+    App().run()
 
 
 if __name__ == "__main__":
