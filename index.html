@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <!--
-  TIMING CLASH
+  TIMING CLASH - zero-build GitHub Pages launcher.
 
   This single index.html boots Pyodide (CPython compiled to WebAssembly),
   installs pygame-ce from the Pyodide package index, downloads timing_clash.py
@@ -73,7 +73,7 @@
   <canvas id="canvas" tabindex="0" width="1280" height="720"></canvas>
 
   <div id="bar2">
-    <span>Click the game to focus it &middot; Space / A to strike &middot; P to pause &middot; M to mute</span>
+    <span>Click the game to focus it &middot; Space / A to strike &middot; P pause &middot; Backspace / B = back &middot; M mute</span>
     <button id="fs" type="button">Fullscreen</button>
   </div>
   <pre id="log"></pre>
@@ -97,7 +97,7 @@
   // Keep arrows / space from scrolling the page while the game has focus.
   window.addEventListener("keydown", e => {
     if (document.activeElement === canvas &&
-        ["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
+        ["Space", "Backspace", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
   }, { passive: false });
   $("fs").addEventListener("click", () => {
     (canvas.requestFullscreen || canvas.webkitRequestFullscreen || (() => {})).call(canvas);
