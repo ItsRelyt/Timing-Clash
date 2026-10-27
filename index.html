@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<!--
+  TIMING CLASH — zero-build GitHub Pages launcher.
+
+  This single index.html boots Pyodide (CPython compiled to WebAssembly),
+  installs pygame-ce from the Pyodide package index, downloads the game's
+  .py file sitting next to it in the repo, and runs it inside the browser.
+
+  No bundler, no CI, no build steps: just publish this folder with GitHub
+  Pages (Settings → Pages → Deploy from a branch) and the game runs.
+
+  To change which script is played, edit GAME_FILE below.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timing Clash</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0d0a26; }
+  body {
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 12px; padding: 16px;
+    font-family: "Courier New", ui-monospace, monospace; color: #cfd0ff;
+  }
+  h1 {
+    margin: 0; font-size: clamp(20px, 4vw, 34px); letter-spacing: .18em;
+    text-transform: uppercase;
+    background: linear-gradient(90deg, #5ac8ff, #ff5aa0, #ffd250);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  #status { min-height: 1.4em; font-size: 14px; opacity: .85; text-align: center; }
+  #status.error { color: #ff6b6b; }
+  #canvas {
+    display: none; outline: none; border-radius: 8px;
+    image-rendering: pixelated;
+    box-shadow: 0 0 40px rgba(90, 120, 255, .35), 0 0 0 2px #2c2f5a inset;
+    max-width: 100%; height: auto; touch-action: none;
+  }
+  #canvas:focus { box-shadow: 0 0 40px rgba(90, 200, 255, .5), 0 0 0 2px #5ac8ff inset; }
+  #boot { max-width: 640px; text-align: center; }
+  .bar {
+    width: 260px; height: 10px; margin: 14px auto 0; border: 2px solid #3a3f7a;
+    border-radius: 6px; overflow: hidden;
+  }
+  .bar > div {
+    height: 100%; width: 30%; background: linear-gradient(90deg, #5ac8ff, #ff5aa0);
+    animation: slide 1.2s linear infinite;
+  }
+  @keyframes slide { from { transform: translateX(-100%);} to { transform: translateX(380%);} }
+  #hint { font-size: 12px; opacity: .55; margin-top: 6px; }
+  progress { accent-color: #5ac8ff; }
+</style>
+</head>
+<body>
+  <h1>⚡ Timing Clash ⚡</h1>
+
+  <div id="boot">
+    <div id="status">Booting Pyodide (WebAssembly CPython)…</div>
+    <div class="bar"><div></div></div>
+    <div id="hint">First load fetches ~15&nbsp;MB of runtime &amp; pygame-ce, then caches it.</div>
+  </div>
+
+  <!-- SDL/pygame-emscripten renders into this canvas.
+       IMPORTANT: the id must be exactly "canvas" — that is how SDL inside
+       Pyodide finds its render target (and resumes audio on first click). -->
+  <canvas id="canvas" tabindex="0" width="1000" height="600"></canvas>
+
+  <script src="https://cdn.jsdelivr.net/pyodide/v0.27.5/full/pyodide.js"></script>
+  <script>
+  // ====================================================================
+  // CONFIG — the one and only thing you may ever need to change
+  // ====================================================================
+  const GAME_FILE = "timing_clash_new.py";   // plain Python file in this repo
+  const PYODIDE_VERSION = "0.27.5";           // has pygame-ce >= 2.3.5 bundled
+  // ====================================================================
+
+  const statusEl = document.getElementById("status");
+  const bootEl   = document.getElementById("boot");
+  const canvas   = document.getElementById("canvas");
+  const setStatus = t => { statusEl.className = ""; statusEl.textContent = t; };
+  const setError = t => { statusEl.className = "error"; statusEl.textContent = t; };
+
+  // ---- tiny console for showing the game's stdout/stderr -------------
+  function ensureLogPanel() {
+    let p = document.getElementById("log");
+    if (p) return p;
+    p = document.createElement("pre");
+    p.id = "log";
+    p.style.cssText =
+      "display:none;max-width:900px;max-height:180px;overflow:auto;width:100%;" +
+      "background:#120f2e;border:1px solid #333a6e;border-radius:8px;" +
+      "padding:10px;font-size:12px;line-height:1.4;white-space:pre-wrap;color:#9fe8b0;";
+    document.body.appendChild(p);
+    return p;
+  }
+  function printLog(text) {
+    const p = ensureLogPanel();
+    p.style.display = "block";
+    p.textContent += text + "\n";
+    p.scrollTop = p.scrollHeight;
+  }
+
+  // ---- make sure the module is fetched fresh, never from cache -------
+  async function fetchGameSource() {
+    const url = new URL(GAME_FILE, location.href).href;
+    try {
+      const r = await fetch(url, { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return await r.text();
+    } catch (e) {
+      // Fallback: some hosts/caches serve stale headers — try again plainly.
+      const r = await fetch(url + "?raw=" + Date.now());
+      if (!r.ok) throw new Error("Could not download " + GAME_FILE + " (" + r.status + ")");
+      return await r.text();
+    }
+  }
+
+  // ---- main boot sequence --------------------------------------------
+  async function boot() {
+    try {
+      setStatus("Loading Pyodide runtime…");
+      const pyodide = await loadPyodide({
+        indexURL: `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`,
+        fullStdLib: false,
+      });
+
+      // Route Python's stdout/stderr into an on-page console.
+      pyodide.setStdout({ batched: s => { console.log(s); printLog(s); } });
+      pyodide.setStderr({ batched: s => { console.warn(s); printLog(s); } });
+
+      setStatus("Loading pygame-ce from the Pyodide package index…");
+      await pyodide.loadPackage(
+        ["pygame-ce"],
+        { messageCallback: m => {
+            if (m.type === "status" && m.content) setStatus(m.content);
+          } }
+      );
+
+      setStatus("Downloading " + GAME_FILE + "…");
+      const src = await fetchGameSource();
+
+      // Save-file support: the game writes timing_clash_save.json next to
+      // its own __file__. Give it a real directory in the Emscripten FS
+      // (persisted via IndexedDB by Pyodide) so high scores survive reloads.
+      await pyodide.runPythonAsync(`
+import os
+from pathlib import Path
+GAME_DIR = Path.home() / "timing_clash"
+GAME_DIR.mkdir(parents=True, exist_ok=True)
+os.chdir(GAME_DIR)
+`);
+      const gamePath = "/home/web_user/timing_clash/" + GAME_FILE;
+      pyodide.FS.writeFile(gamePath, src);
+
+      setStatus("Starting engine… click the canvas for sound & keyboard.");
+      canvas.style.width = "min(1000px, 96vw)";
+
+      // Run the same .py file exactly like `python timing_clash_new.py`
+      // (runpy gives it __name__ == "__main__"). The game's main loop is
+      // cooperative with SDL/Emscripten, so this call drives the frame
+      // loop and resolves when the user quits the game.
+      await pyodide.runPythonAsync(`
+import runpy
+runpy.run_path(${JSON.stringify(gamePath)}, run_name="__main__")
+`);
+
+      bootEl.style.display = "none";
+      canvas.style.display = "block";
+      canvas.focus();
+      canvas.addEventListener("click", () => canvas.focus());
+      setStatus("");
+    } catch (err) {
+      console.error(err);
+      setError("Failed to start: " + (err && err.message ? err.message : err) +
+               " — check the browser console (F12) for details.");
+    }
+  }
+
+  boot();
+  </script>
+</body>
+</html>
