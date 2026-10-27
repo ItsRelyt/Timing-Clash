@@ -12,7 +12,8 @@ in code.  The only dependency is pygame:
 MODES
   CAMPAIGN   Fight through endless levels.  Every 5th level is a boss, every
              5 levels is a new world.  Earn up to 3 stars per level.
-  SURVIVAL   One heart pool, endless waves.  Chase your best wave and score.
+  ENDLESS RUN  Roguelike: pick 1 of 3 perks after every wave and see how deep
+             you can get.
   VERSUS 2P  Local duel on one keyboard.  P1 = A, P2 = L.  Best of 1 / 3 / 5.
 
 HOW TO PLAY
@@ -22,7 +23,7 @@ HOW TO PLAY
   meter fills, it hits you.  Every 5-hit streak is a POWER STRIKE that also
   heals a heart.
 
-F11 = fullscreen   M = mute   P / ESC = pause
+F11 = fullscreen   M = mute   P = pause   BACKSPACE / B / ESC = back
 
 Also runs in the browser via Pyodide (see index.html for the GitHub Pages launcher).
 """
@@ -51,6 +52,7 @@ GROUND = 150               # y where characters' feet rest
 BAR_TOP, BAR_H = 30, 100   # timing bar geometry
 RATE = 22050               # audio sample rate
 SAVE_NAME = "timing_clash_save.json"
+BACK_KEYS = (pygame.K_BACKSPACE, pygame.K_ESCAPE, pygame.K_b)   # Esc also exits browser fullscreen
 WEB = sys.platform == "emscripten"   # running inside Pyodide / a browser
 
 # DawnBringer 16 palette: every colour in the game comes from here
@@ -89,6 +91,9 @@ class SaveData:
         self.stars = {}
         self.survival_best = 0
         self.survival_wave = 0
+        self.coins = 0
+        self.upgrades = {}
+        self.parry_done = False
         self.settings = dict(DEFAULT_SETTINGS)
         self.load()
 
@@ -103,6 +108,9 @@ class SaveData:
                 self.stars = {str(k): int(v) for k, v in d.get("stars", {}).items()}
                 self.survival_best = int(d.get("survival_best", 0))
                 self.survival_wave = int(d.get("survival_wave", 0))
+                self.coins = max(0, int(d.get("coins", 0)))
+                self.upgrades = {str(k): int(v) for k, v in d.get("upgrades", {}).items()}
+                self.parry_done = bool(d.get("parry_done", False))
                 for k, v in d.get("settings", {}).items():
                     if k in DEFAULT_SETTINGS and type(v) is type(DEFAULT_SETTINGS[k]):
                         self.settings[k] = v
@@ -114,6 +122,7 @@ class SaveData:
         payload = {
             "highest_unlocked_level": self.highest, "stars": self.stars,
             "survival_best": self.survival_best, "survival_wave": self.survival_wave,
+            "coins": self.coins, "upgrades": self.upgrades, "parry_done": self.parry_done,
             "settings": self.settings,
         }
         for p in self.paths:
@@ -136,6 +145,7 @@ class SaveData:
     def reset(self):
         self.highest, self.stars = 1, {}
         self.survival_best = self.survival_wave = 0
+        self.coins, self.upgrades, self.parry_done = 0, {}, False
         self.save()
 
 
@@ -393,6 +403,7 @@ ENEMY_ART = {"slime": SLIME, "bat": BAT, "goblin": GOBLIN,
 HEART = [".66.66.", "6f66666", "6666666", ".66666.", "..666..", "...6..."]
 STAR = ["...e...", "..eee..", "eeeeeee", ".eeeee.", "..eee..", ".ee.ee.", ".e...e."]
 LOCK = ["..aaa..", ".a...a.", ".a...a.", "aaaaaaa", "aa333aa", "aa333aa", "aaaaaaa"]
+COIN = [".eeee.", "eeffee", "eefeee", "eeee99", "e9999e", ".9999."]
 SKULL_ICON = [".fffff.", "f0fff0f", "f0fff0f", ".fffff.", "..f.f..", "..fff.."]
 
 _spr_cache = {}
@@ -468,7 +479,7 @@ def enemy_sprite(kind, hue=0.0, scale=1):
 def icon(name, empty=False):
     key = ("icon", name, empty)
     if key not in _spr_cache:
-        data = {"heart": HEART, "star": STAR, "lock": LOCK, "skull": SKULL_ICON}[name]
+        data = {"heart": HEART, "star": STAR, "lock": LOCK, "skull": SKULL_ICON, "coin": COIN}[name]
         remap = None
         if empty:
             remap = {"6": "3", "f": "3", "e": "3"}
@@ -1037,7 +1048,8 @@ class TimingBar:
         self.scale = 1.0
         self.configure(0.6, 0.3, [], 0.8)
 
-    def configure(self, speed, zone, mods, lock):
+    def configure(self, speed, zone, mods, lock, perfect=0.34):
+        self.perfect_frac = perfect
         self.base_speed = speed
         self.speed_mult = 1.0
         self.base_zone = self.zone = zone
@@ -1111,7 +1123,7 @@ class TimingBar:
         half = self.zone / 2
         d = abs(self.pos - self.zone_c)
         if d <= half:
-            perfect = d <= half * 0.34
+            perfect = d <= half * self.perfect_frac
             self.speed_mult = min(self.speed_mult + 0.03, 1.5)
             if "shrink" in self.mods:
                 self.zone = max(0.10, self.zone * 0.92)
@@ -1155,7 +1167,7 @@ class TimingBar:
                 zh = max(3, zy1 - zy0)
                 pygame.draw.rect(s, FOREST, (x, zy0, w, zh))
                 pygame.draw.rect(s, GREEN, (x + 1, zy0 + 1, w - 2, max(1, zh - 2)))
-                ph = max(2, int(round(zh * 0.34)))
+                ph = max(2, int(round(zh * self.perfect_frac)))
                 py = zy0 + (zh - ph) // 2
                 pygame.draw.rect(s, YELLOW, (x + 1, py, w - 2, ph))
                 pygame.draw.rect(s, WHITE, (x + 1, py, w - 2, 1))
@@ -1191,6 +1203,7 @@ ENEMIES = [
 MOD_TEXT = {
     "erratic": "WILD SPEED", "drift": "DRIFTING ZONE", "decoy": "RED TRAP ZONE",
     "blink": "VANISHING ZONE", "shrink": "SHRINKING ZONE", "flip": "SUDDEN REVERSE",
+    "armor": "ARMORED", "regen": "REGENERATES", "frenzy": "FRENZY AT HALF HP",
 }
 TIER_PREFIX = ["", "ANGRY ", "ELITE ", "DEADLY ", "ANCIENT "]
 _MOD_POOL = ["flip", "drift", "erratic", "blink", "decoy", "shrink"]
@@ -1210,19 +1223,79 @@ def make_level(n):
             m = _MOD_POOL[(n + j) % len(_MOD_POOL)]
             if m not in mods:
                 mods.append(m)
-    hp = max(3, int(round(min(14, 3 + n // 2) * e["hp"])))
+    abil = []
+    if e["kind"] == "golem":
+        abil.append("armor")
+    if e["kind"] == "slime" and (tier >= 1 or boss):
+        abil.append("regen")
+    if e["kind"] == "bat" and (n >= 8 or boss):
+        abil.append("frenzy")
+    base = 5 if n == 1 else min(20, 7 + n // 2)
+    hp = max(5, int(round(base * e["hp"])))
     if boss:
         hp = int(hp * 1.6) + 2
     return {
         "level": n, "boss": boss, "kind": e["kind"],
         "name": e["boss"] if boss else TIER_PREFIX[min(tier, 4)] + e["name"],
         "hue": ((0.55 + 0.13 * tier) % 1.0) if boss else (0.13 * tier) % 1.0,
-        "mods": mods, "hp": hp,
+        "mods": mods, "abil": abil, "hp": hp,
         "speed": min(1.35, 0.55 + 0.04 * (n - 1)) * (1.05 if boss else 1.0),
         "zone": max(0.12, 0.34 - 0.007 * (n - 1) - (0.02 if boss else 0.0)),
-        "gauge_time": max(3.4, 9.5 - 0.2 * (n - 1)) * (0.85 if boss else 1.0),
+        "gauge_time": (10.0 if n == 1 else max(3.2, 6.5 - 0.12 * (n - 1))) * (0.85 if boss else 1.0),
+        "windup": 1.0 if n == 1 else max(0.55, 0.95 - 0.012 * n),     # seconds of warning before it hits
+        "pwin": max(0.18, 0.40 - 0.006 * n),                          # parry window (end of the warning)
         "theme": ((n - 1) // 5) % 5,
     }
+
+
+# --------------------------------------------------------------------------
+#  PERKS (endless run) and UPGRADES (permanent, bought with coins)
+# --------------------------------------------------------------------------
+PERKS = [
+    {"id": "wide", "name": "WIDE ZONE", "max": 4, "w": 3, "desc": ["GREEN ZONE", "+15% BIGGER"]},
+    {"id": "gold", "name": "GOLDEN EYE", "max": 4, "w": 3, "desc": ["GOLD CENTRE", "+30% BIGGER"]},
+    {"id": "slow", "name": "SLOW MO", "max": 4, "w": 2, "desc": ["THE LINE MOVES", "8% SLOWER"]},
+    {"id": "heart", "name": "IRON HEART", "max": 3, "w": 2, "desc": ["+1 MAX HEART", "AND HEAL 1"]},
+    {"id": "vamp", "name": "VAMPIRE", "max": 2, "w": 2, "desc": ["KILLING HEALS", "1 HEART"]},
+    {"id": "sharp", "name": "SHARP BLADE", "max": 3, "w": 3, "desc": ["PERFECT HITS", "DEAL +1"]},
+    {"id": "calm", "name": "QUICK HANDS", "max": 3, "w": 2, "desc": ["MISS LOCK IS", "35% SHORTER"]},
+    {"id": "patience", "name": "PATIENCE", "max": 4, "w": 2, "desc": ["RAGE FILLS", "20% SLOWER"]},
+    {"id": "parry", "name": "STEEL NERVES", "max": 3, "w": 3, "desc": ["PARRY WINDOW", "40% LONGER"]},
+    {"id": "riposte", "name": "RIPOSTE", "max": 3, "w": 2, "desc": ["PARRY COUNTER", "DEALS +2"]},
+    {"id": "magnet", "name": "COIN MAGNET", "max": 3, "w": 2, "desc": ["+50% COINS"]},
+    {"id": "lucky", "name": "LUCKY STREAK", "max": 1, "w": 2, "desc": ["POWER STRIKE", "EVERY 4 HITS"]},
+    {"id": "wind", "name": "SECOND WIND", "max": 3, "w": 1, "desc": ["SURVIVE ONE", "DEADLY HIT"]},
+    {"id": "ward", "name": "WARD", "max": 1, "w": 2, "desc": ["BLOCKS THE FIRST", "HIT EACH WAVE"]},
+    {"id": "crit", "name": "CRITICAL", "max": 4, "w": 3, "desc": ["20% CHANCE OF", "DOUBLE DAMAGE"]},
+    {"id": "forgive", "name": "STEADY HANDS", "max": 1, "w": 2, "desc": ["FIRST MISS EACH", "WAVE IS FREE"]},
+]
+PERK_BY_ID = {p["id"]: p for p in PERKS}
+
+
+def roll_perks(owned, n=3):
+    pool = [p for p in PERKS if owned.get(p["id"], 0) < p["max"]]
+    out = []
+    while pool and len(out) < n:
+        r = random.uniform(0, sum(p["w"] for p in pool))
+        acc = 0.0
+        for p in pool:
+            acc += p["w"]
+            if r <= acc:
+                out.append(p["id"])
+                pool.remove(p)
+                break
+    return out
+
+
+UPGRADES = [
+    {"id": "hearts", "name": "VITALITY", "desc": "+1 STARTING HEART PER LEVEL", "costs": [150, 400, 900]},
+    {"id": "zone", "name": "STEADY ZONE", "desc": "+6% GREEN ZONE PER LEVEL", "costs": [100, 220, 400, 700]},
+    {"id": "gold", "name": "KEEN EYE", "desc": "+10% GOLD CENTRE PER LEVEL", "costs": [100, 220, 400, 700]},
+    {"id": "calm", "name": "CALM", "desc": "-10% MISS LOCK TIME PER LEVEL", "costs": [120, 300, 600]},
+    {"id": "patience", "name": "COOL HEAD", "desc": "-6% ENEMY RAGE SPEED PER LEVEL", "costs": [140, 300, 550, 900]},
+    {"id": "parry", "name": "GUARD", "desc": "+10% PARRY WINDOW PER LEVEL", "costs": [120, 300, 600]},
+    {"id": "coin", "name": "TREASURE", "desc": "+10% COINS EARNED PER LEVEL", "costs": [100, 200, 350, 550, 800]},
+]
 
 
 # --------------------------------------------------------------------------
@@ -1309,18 +1382,21 @@ class Overlay(Scene):
             cy += 12
 
 
-def make_pause(app, restart):
+def make_pause(app, restart, extra=()):
     opts = [((pygame.K_p, pygame.K_ESCAPE, pygame.K_RETURN), "P", "RESUME", app.pop),
             ((pygame.K_r,), "R", "RESTART", restart),
             ((pygame.K_q,), "Q", "QUIT TO MENU", lambda: app.pop(2))]
-    return Overlay(app, "PAUSED", WHITE, [("CATCH YOUR BREATH, HERO", STEEL)], opts)
+    lines = [("CATCH YOUR BREATH, HERO", STEEL)]
+    if extra:
+        lines += [("YOUR PERKS", YELLOW)] + list(extra)
+    return Overlay(app, "PAUSED", WHITE, lines, opts)
 
 
 # --------------------------------------------------------------------------
 #  TITLE
 # --------------------------------------------------------------------------
 class TitleScene(Scene):
-    ITEMS = ["CAMPAIGN", "SURVIVAL", "VERSUS 2P", "HOW TO PLAY", "SETTINGS", "QUIT"]
+    ITEMS = ["CAMPAIGN", "ENDLESS RUN", "VERSUS 2P", "UPGRADES", "HOW TO PLAY", "SETTINGS", "QUIT"]
 
     def __init__(self, app):
         super().__init__(app)
@@ -1332,7 +1408,7 @@ class TitleScene(Scene):
         self.bg = get_bg(self.theme)
         self.amb = Ambient(self.theme)
         self.shade = pygame.Surface((W, H), pygame.SRCALPHA)
-        self.shade.fill(INK + (90,))
+        self.shade.fill(INK + (130,))
 
     def update(self, dt):
         self.t += dt
@@ -1348,8 +1424,10 @@ class TitleScene(Scene):
         elif i == 2:
             a.push(VersusScene(a))
         elif i == 3:
-            a.push(HowToScene(a))
+            a.push(ShopScene(a))
         elif i == 4:
+            a.push(HowToScene(a))
+        elif i == 5:
             a.push(SettingsScene(a))
         else:
             a.running = False
@@ -1366,7 +1444,7 @@ class TitleScene(Scene):
             self.app.audio.play("select")
         elif e.key in (pygame.K_RETURN, pygame.K_SPACE):
             self.activate(self.sel)
-        elif pygame.K_1 <= e.key <= pygame.K_6 and e.key - pygame.K_1 < n:
+        elif pygame.K_1 <= e.key <= pygame.K_7 and e.key - pygame.K_1 < n:
             self.sel = e.key - pygame.K_1
             self.activate(self.sel)
         elif e.key == pygame.K_ESCAPE and not WEB:
@@ -1378,7 +1456,7 @@ class TitleScene(Scene):
         s.blit(self.shade, (0, 0))
         bob = int(round(math.sin(self.t * 2.2) * 2))
         draw_text(s, "TIMING", W // 2, 10 + bob, YELLOW, 5, "center", BROWN)
-        draw_text(s, "CLASH", W // 2, 52 - bob, WHITE, 5, "center", RED)
+        draw_text(s, "CLASH", W // 2, 50 - bob, WHITE, 5, "center", RED)
         # the two rivals
         hb = 1 if math.sin(self.t * 5) > 0 else 0
         s.blit(pygame.transform.scale(hero_sprite(0), (32, 32)), (34, 98 - hb))
@@ -1388,7 +1466,7 @@ class TitleScene(Scene):
         draw_shadow(s, 270, 132, 30)
         # menu
         for i, item in enumerate(self.ITEMS):
-            y = 92 + i * 12
+            y = 92 + i * 10
             if i == self.sel:
                 label = f"> {item} <" if int(self.t * 3) % 2 == 0 else f"  {item}  "
                 draw_text(s, label, W // 2, y, YELLOW, 1, "center")
@@ -1397,7 +1475,8 @@ class TitleScene(Scene):
         sv = self.app.save
         draw_text(s, f"LEVEL {sv.highest}", 6, 172, STEEL)
         draw_text(s, f"BEST WAVE {sv.survival_wave}", W - 6, 172, STEEL, 1, "right")
-        draw_text(s, "ARROWS + ENTER", W // 2, 172, STEEL, 1, "center")
+        s.blit(icon("coin"), (W // 2 - 22, 170))
+        draw_text(s, str(sv.coins), W // 2 - 10, 172, YELLOW)
 
 
 # --------------------------------------------------------------------------
@@ -1409,7 +1488,7 @@ class LevelSelectScene(Scene):
         self.cur = app.save.highest
         self.t = 0.0
         self.shade = pygame.Surface((W, H), pygame.SRCALPHA)
-        self.shade.fill(INK + (175,))
+        self.shade.fill(INK + (205,))
 
     def update(self, dt):
         self.t += dt
@@ -1431,7 +1510,7 @@ class LevelSelectScene(Scene):
             self.app.audio.play("confirm")
             self.app.push(BattleScene(self.app, "campaign", self.cur))
             return
-        elif e.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+        elif e.key in BACK_KEYS:
             self.app.audio.play("back")
             self.app.pop()
             return
@@ -1479,13 +1558,15 @@ class LevelSelectScene(Scene):
         draw_text(s, f"HP {cur_lv['hp']}  SPEED {cur_lv['speed']:.2f}  ZONE {int(cur_lv['zone'] * 100)}%", 12, 149, WHITE)
         traits = ", ".join(MOD_TEXT[m] for m in cur_lv["mods"]) or "NO TRICKS - JUST TIMING"
         draw_text(s, traits, 12, 158, CYAN)
-        draw_text(s, "ARROWS: PICK   ENTER: FIGHT   ESC: BACK", W // 2, 171, STEEL, 1, "center")
+        draw_text(s, "ARROWS: PICK   ENTER: FIGHT   BKSP: BACK", W // 2, 171, STEEL, 1, "center")
 
 
 # --------------------------------------------------------------------------
 #  HOW TO PLAY
 # --------------------------------------------------------------------------
 class HowToScene(Scene):
+    PAGES = 3
+
     def __init__(self, app):
         super().__init__(app)
         self.page = 0
@@ -1494,7 +1575,7 @@ class HowToScene(Scene):
         self.bar.configure(0.55, 0.3, [], 0.5)
         self.bar.zone_c = 0.5
         self.shade = pygame.Surface((W, H), pygame.SRCALPHA)
-        self.shade.fill(INK + (170,))
+        self.shade.fill(INK + (205,))
 
     def update(self, dt):
         self.t += dt
@@ -1504,17 +1585,25 @@ class HowToScene(Scene):
     def handle(self, e):
         if e.type != pygame.KEYDOWN:
             return
-        if e.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+        if e.key in BACK_KEYS:
             self.app.audio.play("back")
             self.app.pop()
-        elif e.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_SPACE, pygame.K_RETURN):
-            self.page = 1 - self.page
+        elif e.key == pygame.K_LEFT:
+            self.page = (self.page - 1) % self.PAGES
             self.app.audio.play("select")
+        elif e.key in (pygame.K_RIGHT, pygame.K_SPACE, pygame.K_RETURN):
+            self.page = (self.page + 1) % self.PAGES
+            self.app.audio.play("select")
+
+    def draw_lines(self, s, lines, x=148):
+        for i, (t, c) in enumerate(lines):
+            draw_text(s, t, x, 32 + i * 11, c)
 
     def draw(self, s):
         s.blit(get_bg(2), (0, 0))
         s.blit(self.shade, (0, 0))
-        draw_text(s, "HOW TO PLAY", W // 2, 6, YELLOW, 2, "center")
+        titles = ["HOW TO ATTACK", "HOW TO DEFEND", "ENEMY TRICKS"]
+        draw_text(s, titles[self.page], W // 2, 6, YELLOW, 2, "center")
         if self.page == 0:
             b = self.bar
             b.draw(s)
@@ -1523,29 +1612,52 @@ class HowToScene(Scene):
                                   ("MISS", zc + int(b.zone * b.h) + 6, RED)):
                 pygame.draw.rect(s, col, (b.x + 26, y, 10, 1))
                 draw_text(s, label, b.x + 40, y - 3, col)
-            lines = [
+            self.draw_lines(s, [
                 ("1. WATCH THE LINE BOUNCE", WHITE), ("2. HIT SPACE IN THE GREEN", WHITE),
                 ("   GOLD CENTRE = PERFECT", YELLOW), ("3. HITS HURT THE ENEMY", WHITE),
-                ("4. MISSES FILL ITS RAGE", WHITE), ("   FULL RAGE = LOSE A HEART", RED),
-                ("5. 5 HIT STREAK = POWER", WHITE), ("   STRIKE AND HEAL", CYAN),
-                ("", WHITE), ("P1: SPACE / A / CLICK", BLUE), ("P2: L", RED),
-                ("P PAUSE  F11 SCREEN  M MUTE", STEEL),
-            ]
-            for i, (t, c) in enumerate(lines):
-                draw_text(s, t, 148, 32 + i * 11, c)
+                ("4. MISS = BAR LOCKS + RAGE", RED), ("5. 5 HIT STREAK = POWER", WHITE),
+                ("   STRIKE AND HEAL", CYAN), ("", WHITE),
+                ("P1: SPACE / A / CLICK", BLUE), ("P2: L", RED),
+                ("P PAUSE   M MUTE", STEEL), ("BKSP / B / ESC = BACK", STEEL)])
+        elif self.page == 1:
+            cx, cy = 52, 90
+            ph = self.t % 2.6
+            wind = max(0.0, 1.7 - ph) if ph < 1.7 else 0.0
+            hot = 0 < wind <= 0.45
+            s.blit(hero_sprite(0), (cx - 8, cy - 8))
+            s.blit(enemy_sprite("slime"), (cx + 56, cy - 8))
+            if wind > 0:
+                pygame.draw.circle(s, STEEL, (cx, cy), 10, 1)
+                pygame.draw.circle(s, YELLOW if hot else RED, (cx, cy), 10 + int(26 * wind / 1.7), 2 if hot else 1)
+                draw_text(s, "!", cx + 64, cy - 24, RED, 3, "center")
+                if hot:
+                    draw_text(s, "NOW!", cx, cy - 34, YELLOW, 1, "center")
+            elif ph < 2.3:
+                draw_text(s, "PARRY!", cx, cy - 34, CYAN, 2, "center")
+                draw_text(s, "STUN", cx + 64, cy - 24, YELLOW, 1, "center")
+            self.draw_lines(s, [
+                ("WHEN THE RAGE METER FILLS", WHITE), ("THE ENEMY WINDS UP.", WHITE),
+                ("A RING SHRINKS ON YOU.", WHITE), ("HIT SPACE WHEN IT TURNS", WHITE),
+                ("GOLD TO PARRY!", YELLOW), ("", WHITE),
+                ("PARRY = NO DAMAGE", GREEN), ("ENEMY STUNNED: +1 DAMAGE", CYAN),
+                ("TOO EARLY = NO RETRY", RED), ("BOSSES ATTACK TWICE", RED),
+                ("", WHITE), ("COINS BUY UPGRADES", YELLOW)])
         else:
-            draw_text(s, "EVERY ENEMY HAS A TRICK", W // 2, 26, WHITE, 1, "center")
             for i, e in enumerate(ENEMIES):
                 col, row = i % 2, i // 2
-                x, y = 16 + col * 156, 42 + row * 38
-                panel(s, (x, y - 4, 148, 34))
+                x, y = 16 + col * 156, 30 + row * 36
+                panel(s, (x, y - 3, 148, 32))
                 bob = 1 if math.sin(self.t * 5 + i) > 0 else 0
                 s.blit(enemy_sprite(e["kind"]), (x + 6, y - bob))
-                draw_text(s, e["name"], x + 28, y + 1, YELLOW)
-                trait = MOD_TEXT[e["mods"][0]] if e["mods"] else "NO TRICKS"
-                draw_text(s, trait, x + 28, y + 12, CYAN)
-            draw_text(s, "EVERY 5TH LEVEL IS A BOSS WITH EXTRA TRICKS", W // 2, 158, RED, 1, "center")
-        draw_text(s, f"< PAGE {self.page + 1}/2 >   ESC: BACK", W // 2, 171, STEEL, 1, "center")
+                draw_text(s, e["name"], x + 28, y, YELLOW)
+                trait = MOD_TEXT[e["mods"][0]] if e["mods"] else "NO BAR TRICKS"
+                draw_text(s, trait, x + 28, y + 10, CYAN)
+                ab = {"golem": "ARMORED", "slime": "REGENERATES (LATER)", "bat": "FRENZY AT HALF HP"}.get(e["kind"], "")
+                if ab:
+                    draw_text(s, ab, x + 28, y + 19, ORANGE)
+            draw_text(s, "EVERY 5TH LEVEL IS A BOSS WITH EXTRA TRICKS", W // 2, 142, RED, 1, "center")
+            draw_text(s, "ARMOR: ONLY PERFECT HITS DO FULL DAMAGE", W // 2, 153, STEEL, 1, "center")
+        draw_text(s, f"< PAGE {self.page + 1}/{self.PAGES} >   BKSP: BACK", W // 2, 171, STEEL, 1, "center")
 
 
 # --------------------------------------------------------------------------
@@ -1572,7 +1684,7 @@ class SettingsScene(Scene):
         self.confirm = False
         self.t = 0.0
         self.shade = pygame.Surface((W, H), pygame.SRCALPHA)
-        self.shade.fill(INK + (170,))
+        self.shade.fill(INK + (205,))
 
     def update(self, dt):
         self.t += dt
@@ -1604,7 +1716,7 @@ class SettingsScene(Scene):
         if e.type != pygame.KEYDOWN:
             return
         n = len(self.items)
-        if e.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+        if e.key in BACK_KEYS:
             self.app.audio.play("back")
             self.app.pop()
         elif e.key in (pygame.K_UP, pygame.K_w):
@@ -1640,7 +1752,160 @@ class SettingsScene(Scene):
                 col = (GREEN if v else RED) if fmt is None else CYAN
             draw_text(s, f"< {txt} >" if sel and key != "reset" else txt, 280, y, col, 1, "right")
         draw_text(s, self.items[self.sel][4], W // 2, 156, STEEL, 1, "center")
-        draw_text(s, "UP/DOWN: SELECT  LEFT/RIGHT: CHANGE  ESC: BACK", W // 2, 171, STEEL, 1, "center")
+        draw_text(s, "UP/DOWN: SELECT  LEFT/RIGHT: CHANGE  BKSP: BACK", W // 2, 171, STEEL, 1, "center")
+
+
+# --------------------------------------------------------------------------
+#  PERK PICKER  (endless run: choose 1 of 3 after every wave)
+# --------------------------------------------------------------------------
+class PerkScene(Scene):
+    overlay = True
+
+    def __init__(self, app, battle, choices):
+        super().__init__(app)
+        self.battle, self.choices = battle, choices
+        self.sel = 1 if len(choices) > 1 else 0
+        self.t = 0.0
+        self.shade = pygame.Surface((W, H), pygame.SRCALPHA)
+        self.shade.fill(INK + (225,))
+
+    def update(self, dt):
+        self.t += dt
+        if not self.choices:
+            self.app.pop()
+            self.battle.after_perk(None)
+
+    def pick(self, i):
+        if 0 <= i < len(self.choices) and self.t > 0.35:
+            self.app.audio.play("perfect")
+            pid = self.choices[i]
+            self.app.pop()
+            self.battle.after_perk(pid)
+
+    def handle(self, e):
+        if e.type != pygame.KEYDOWN:
+            return
+        n = len(self.choices)
+        if not n:
+            self.app.pop()
+            self.battle.after_perk(None)
+            return
+        if e.key in (pygame.K_LEFT, pygame.K_a):
+            self.sel = (self.sel - 1) % n
+            self.app.audio.play("select")
+        elif e.key in (pygame.K_RIGHT, pygame.K_d):
+            self.sel = (self.sel + 1) % n
+            self.app.audio.play("select")
+        elif e.key in (pygame.K_RETURN, pygame.K_SPACE):
+            self.pick(self.sel)
+        elif pygame.K_1 <= e.key <= pygame.K_3:
+            self.pick(e.key - pygame.K_1)
+
+    def draw(self, s):
+        s.blit(self.shade, (0, 0))
+        b = self.battle
+        draw_text(s, f"WAVE {b.level - 1} CLEARED", W // 2, 8, GREEN, 1, "center")
+        draw_text(s, "CHOOSE A PERK", W // 2, 20, YELLOW, 2, "center")
+        for i, pid in enumerate(self.choices):
+            p = PERK_BY_ID[pid]
+            x, y = 8 + i * 104, 46
+            sel = i == self.sel
+            lift = -3 if sel else 0
+            panel(s, (x, y + lift, 96, 88), NAVY)
+            if sel:
+                col = YELLOW if int(self.t * 5) % 2 == 0 else ORANGE
+                pygame.draw.rect(s, col, (x - 1, y + lift - 1, 98, 90), 2)
+            draw_text(s, str(i + 1), x + 6, y + lift + 6, STEEL)
+            draw_text(s, p["name"], x + 48, y + lift + 18, YELLOW, 1, "center")
+            owned = b.pk(pid)
+            for k in range(p["max"]):
+                pygame.draw.rect(s, INK, (x + 48 - p["max"] * 4 + k * 8 - 1, y + lift + 30, 7, 7))
+                pygame.draw.rect(s, GREEN if k < owned else (CYAN if k == owned else CHAR),
+                                 (x + 48 - p["max"] * 4 + k * 8, y + lift + 31, 5, 5))
+            for j, line in enumerate(p["desc"]):
+                draw_text(s, line, x + 48, y + lift + 46 + j * 11, WHITE, 1, "center")
+            if owned:
+                draw_text(s, f"UPGRADES TO LV {owned + 1}", x + 48, y + lift + 74, CYAN, 1, "center")
+        owned_n = sum(b.perks.values())
+        draw_text(s, f"PERKS OWNED: {owned_n}   HEARTS {b.hearts}/{b.max_hearts}", W // 2, 144, STEEL, 1, "center")
+        draw_text(s, "LEFT/RIGHT + ENTER, OR PRESS 1-3", W // 2, 160, WHITE, 1, "center")
+
+
+# --------------------------------------------------------------------------
+#  UPGRADE SHOP  (permanent, bought with coins)
+# --------------------------------------------------------------------------
+class ShopScene(Scene):
+    def __init__(self, app):
+        super().__init__(app)
+        self.sel = 0
+        self.t = 0.0
+        self.msg, self.msg_t = "", 0.0
+        self.shade = pygame.Surface((W, H), pygame.SRCALPHA)
+        self.shade.fill(INK + (205,))
+
+    def update(self, dt):
+        self.t += dt
+        self.msg_t = max(0.0, self.msg_t - dt)
+
+    def handle(self, e):
+        if e.type != pygame.KEYDOWN:
+            return
+        n = len(UPGRADES)
+        a = self.app
+        if e.key in BACK_KEYS:
+            a.audio.play("back")
+            a.pop()
+        elif e.key in (pygame.K_UP, pygame.K_w):
+            self.sel = (self.sel - 1) % n
+            a.audio.play("select")
+        elif e.key in (pygame.K_DOWN, pygame.K_s):
+            self.sel = (self.sel + 1) % n
+            a.audio.play("select")
+        elif e.key in (pygame.K_RETURN, pygame.K_SPACE):
+            u = UPGRADES[self.sel]
+            lvl = a.save.upgrades.get(u["id"], 0)
+            if lvl >= len(u["costs"]):
+                self.msg, self.msg_t = "ALREADY MAXED", 1.2
+                a.audio.play("locked")
+            elif a.save.coins < u["costs"][lvl]:
+                self.msg, self.msg_t = "NOT ENOUGH COINS", 1.2
+                a.audio.play("miss")
+            else:
+                a.save.coins -= u["costs"][lvl]
+                a.save.upgrades[u["id"]] = lvl + 1
+                a.save.save()
+                self.msg, self.msg_t = "UPGRADED!", 1.2
+                a.audio.play("perfect")
+
+    def draw(self, s):
+        s.blit(get_bg(2), (0, 0))
+        s.blit(self.shade, (0, 0))
+        sv = self.app.save
+        draw_text(s, "UPGRADES", W // 2, 6, YELLOW, 2, "center")
+        s.blit(icon("coin"), (W - 56, 7))
+        draw_text(s, str(sv.coins), W - 44, 8, YELLOW)
+        for i, u in enumerate(UPGRADES):
+            y = 28 + i * 16
+            sel = i == self.sel
+            lvl = sv.upgrades.get(u["id"], 0)
+            mx = len(u["costs"])
+            if sel:
+                pygame.draw.rect(s, NAVY, (10, y - 3, 300, 14))
+                pygame.draw.rect(s, YELLOW if int(self.t * 4) % 2 == 0 else ORANGE, (10, y - 3, 300, 14), 1)
+            draw_text(s, u["name"], 18, y + 1, YELLOW if sel else WHITE)
+            for k in range(mx):
+                pygame.draw.rect(s, INK, (130 + k * 9 - 1, y, 8, 8))
+                pygame.draw.rect(s, GREEN if k < lvl else CHAR, (130 + k * 9, y + 1, 6, 6))
+            if lvl >= mx:
+                draw_text(s, "MAX", 302, y + 1, GREEN, 1, "right")
+            else:
+                cost = u["costs"][lvl]
+                s.blit(icon("coin"), (262, y - 1))
+                draw_text(s, str(cost), 302, y + 1, GREEN if sv.coins >= cost else RED, 1, "right")
+        draw_text(s, UPGRADES[self.sel]["desc"], W // 2, 146, CYAN, 1, "center")
+        if self.msg_t > 0:
+            draw_text(s, self.msg, W // 2, 158, WHITE, 1, "center")
+        draw_text(s, "UP/DOWN: PICK   ENTER: BUY   BKSP: BACK", W // 2, 171, STEEL, 1, "center")
 
 
 # --------------------------------------------------------------------------
@@ -1650,14 +1915,16 @@ class BattleScene(Scene):
     HERO_X = 60
     ENEMY_CX = 244
     INTRO_T = 1.9
-    ATK_T = 0.55
+    ATK_T = 0.4
 
     def __init__(self, app, mode="campaign", level=1):
         super().__init__(app)
         self.mode, self.level = mode, level
         self.diff = DIFFICULTY[app.cfg["difficulty"]]
-        self.max_hearts = self.diff["hearts"]
-        self.hearts = self.max_hearts
+        self.perks = {}            # endless run: perk id -> stacks
+        self.revives = 0
+        self.coins_pending = 0.0
+        self.run_coins = 0         # coins banked during this run
         self.score = 0
         self.fx = FX(app)
         self.bar = TimingBar(W // 2 - 8)
@@ -1668,16 +1935,51 @@ class BattleScene(Scene):
         self.tutorial = mode == "campaign" and level == 1
         self.dim = pygame.Surface((W, 64), pygame.SRCALPHA)
         self.dim.fill(INK + (175,))
+        self.bar_dim = pygame.Surface((TimingBar.W + 26, BAR_H + 10), pygame.SRCALPHA)
+        self.bar_dim.fill(INK + (130,))
+        self.recompute()
+        self.hearts = self.max_hearts
         self.setup_enemy()
 
-    # ---- setup -----------------------------------------------------------
+    # ---- modifiers from permanent upgrades + run perks --------------------
+    def upg(self, k):
+        return self.app.save.upgrades.get(k, 0)
+
+    def pk(self, k):
+        return self.perks.get(k, 0)
+
+    def recompute(self):
+        u, p = self.upg, self.pk
+        self.max_hearts = self.diff["hearts"] + u("hearts") + p("heart")
+        self.m_zone = 1 + 0.06 * u("zone") + 0.15 * p("wide")
+        self.m_perfect = min(0.8, 0.34 * (1 + 0.10 * u("gold") + 0.30 * p("gold")))
+        self.m_speed = max(0.55, 1 - 0.08 * p("slow"))
+        self.m_lock = (0.9 ** u("calm")) * (0.65 ** p("calm"))
+        self.m_gauge = (1.0 / (0.94 ** u("patience"))) * (1.2 ** p("patience"))
+        self.m_pwin = (1 + 0.10 * u("parry")) * (1 + 0.40 * p("parry"))
+        self.m_coin = 1 + 0.10 * u("coin") + 0.5 * p("magnet")
+        self.power_every = 4 if p("lucky") else 5
+        self.crit = min(0.8, 0.2 * p("crit"))
+
+    # ---- setup ------------------------------------------------------------
     def setup_enemy(self):
         lv = make_level(self.level)
         self.lv = lv
         self.hp = self.hp_max = lv["hp"]
-        self.bar.configure(lv["speed"], lv["zone"], lv["mods"], self.diff["lock"])
-        self.gauge = 0.0
-        self.gauge_time = lv["gauge_time"] * self.diff["gauge"]
+        self.bar.configure(lv["speed"] * self.m_speed, min(0.6, lv["zone"] * self.m_zone), lv["mods"],
+                           self.diff["lock"] * self.m_lock, self.m_perfect)
+        self.gauge = 0.3 if self.level > 1 else 0.0      # enemies get going sooner after level 1
+        self.gauge_time = lv["gauge_time"] * self.diff["gauge"] * self.m_gauge
+        self.windup = lv["windup"]
+        self.pwin = min(0.6, lv["pwin"] * self.m_pwin)
+        self.wind = 0.0            # >0 while the enemy is winding up an attack
+        self.wind_total = 1.0
+        self.parry_locked = False
+        self.stun = 0.0
+        self.double_left = 0
+        self.regen_t = 0.0
+        self.ward = bool(self.pk("ward"))
+        self.forgive = bool(self.pk("forgive"))
         self.scale = 2 if lv["boss"] else 1
         self.sprite = enemy_sprite(lv["kind"], lv["hue"], self.scale)
         self.bg = get_bg(lv["theme"])
@@ -1685,14 +1987,25 @@ class BattleScene(Scene):
         self.phase, self.t = "intro", 0.0
         self.go_played = False
         self.combo = 0
-        self.stat = {"perfect": 0, "good": 0, "miss": 0, "lost": 0, "maxcombo": 0}
+        self.stat = {"perfect": 0, "good": 0, "miss": 0, "lost": 0, "maxcombo": 0, "parry": 0}
         self.en_atk = 0.0
         self.en_hit_done = True
 
     def enemy_center(self):
         return self.ENEMY_CX, GROUND - 8 * self.scale
 
-    # ---- input -----------------------------------------------------------
+    def gain(self, n):
+        self.coins_pending += n * self.m_coin
+
+    def bank(self, frac=1.0):
+        n = int(self.coins_pending * frac)
+        self.coins_pending = 0.0
+        self.app.save.coins += n
+        self.run_coins += n
+        self.app.save.save()
+        return n
+
+    # ---- input ------------------------------------------------------------
     def handle(self, e):
         if e.type == pygame.KEYDOWN:
             if e.key in (pygame.K_SPACE, pygame.K_a):
@@ -1708,20 +2021,26 @@ class BattleScene(Scene):
     def pause(self):
         if self.phase in ("intro", "play"):
             self.app.audio.play("select")
-            self.app.push(make_pause(self.app, self.restart))
+            extra = [(f"{PERK_BY_ID[k]['name']} x{v}", CYAN) for k, v in self.perks.items()][:8]
+            self.app.push(make_pause(self.app, self.restart, extra))
 
     def restart(self):
         a = self.app
         a.pop(2)
         a.push(BattleScene(a, self.mode, 1 if self.mode == "survival" else self.level))
 
-    # ---- combat ----------------------------------------------------------
+    # ---- attacking --------------------------------------------------------
     def strike(self):
         if self.phase == "intro":
             if self.t > 0.5:
                 self.t = self.INTRO_T
             return
         if self.phase != "play":
+            return
+        if self.wind > 0:                 # the enemy is winding up: this press is a parry attempt
+            self.try_parry()
+            return
+        if self.en_atk > 0:
             return
         r = self.bar.press()
         a = self.app
@@ -1734,28 +2053,42 @@ class BattleScene(Scene):
             self.combo += 1
             self.stat["perfect" if perfect else "good"] += 1
             self.stat["maxcombo"] = max(self.stat["maxcombo"], self.combo)
-            dmg = 2 if perfect else 1
-            power = self.combo % 5 == 0
+            dmg = 2 + self.pk("sharp") if perfect else 1
+            crit = random.random() < self.crit
+            if crit:
+                dmg *= 2
+            power = self.combo % self.power_every == 0
             if power:
                 dmg += 1
+            if self.stun > 0:
+                dmg += 1
             self.score += (150 if perfect else 100) + 10 * self.combo
+            self.gain(2 if perfect else 1)
             self.hero_atk = 0.2
             ex, ey = self.enemy_center()
             self.fx.shot(self.HERO_X + 14, GROUND - 10, ex - 6 * self.scale, ey, 520,
                          YELLOW if perfect else CYAN, lambda: self.impact(dmg, perfect, power))
             self.fx.text("PERFECT!" if perfect else "GOOD", bx, self.bar.cursor_y() - 6,
                          YELLOW if perfect else GREEN)
+            if crit:
+                self.fx.text("CRIT!", bx, self.bar.cursor_y() - 16, ORANGE)
             a.audio.play("perfect" if perfect else "good")
             self.tutorial = False
         else:
-            self.combo = 0
             self.stat["miss"] += 1
-            self.gauge = min(1.0, self.gauge + 0.22)
+            self.gauge = min(1.0, self.gauge + 0.15)
             a.audio.play("miss")
             a.shake(2, 0.12)
             self.fx.text("TRAP!" if r == "decoy" else "MISS", bx, self.bar.cursor_y() - 6, RED)
             self.fx.burst(bx, self.bar.cursor_y(), RED, 6, 50, 0.3)
+            if self.forgive and r == "miss":      # STEADY HANDS: first miss is free
+                self.forgive = False
+                self.bar.lock = 0.0
+                self.fx.text("FORGIVEN", bx, self.bar.cursor_y() - 16, CYAN)
+            else:
+                self.combo = 0
             if r == "decoy":
+                self.combo = 0
                 self.hurt_hero()
 
     def impact(self, dmg, perfect, power):
@@ -1763,13 +2096,18 @@ class BattleScene(Scene):
             return
         a = self.app
         ex, ey = self.enemy_center()
+        if "armor" in self.lv["abil"] and not perfect and self.stun <= 0:
+            dmg = max(0, dmg - 1)
+            self.fx.text("CLANK!", ex, ey - 10 * self.scale - 18, STEEL)
         self.hp = max(0, self.hp - dmg)
+        self.regen_t = 0.0
         self.en_hurt = 0.3
-        self.gauge = max(0.0, self.gauge - (0.30 if perfect else 0.18))
+        if perfect:
+            self.gauge = max(0.0, self.gauge - 0.06)
         self.hitstop = 0.09 if perfect else 0.05
         self.fx.burst(ex, ey, YELLOW if perfect else CYAN, 8 + 4 * dmg, 110)
         self.fx.text(f"-{dmg}", ex, ey - 10 * self.scale - 8, WHITE, 2)
-        a.shake(1 + dmg, 0.16)
+        a.shake(1 + min(dmg, 4), 0.16)
         a.audio.play("thud")
         if power:
             self.fx.text("POWER STRIKE!", W // 2, 22, ORANGE, 1, 1.1)
@@ -1785,34 +2123,104 @@ class BattleScene(Scene):
             self.fx.text("+1", self.HERO_X + 8, GROUND - 30, GREEN, 2)
             self.app.audio.play("heal")
 
+    # ---- defending --------------------------------------------------------
+    def begin_windup(self, second=False):
+        self.wind_total = self.windup * (0.8 if second else 1.0)
+        self.wind = self.wind_total
+        self.parry_locked = False
+        ex, ey = self.enemy_center()
+        self.fx.text("!", ex, ey - 10 * self.scale - 20, RED, 3, 0.6)
+        self.app.audio.play("rage")
+
+    def try_parry(self):
+        if self.parry_locked:
+            return
+        if self.wind <= self.pwin:
+            self.parry_success()
+        else:
+            self.parry_locked = True            # pressed too early: no second try this attack
+            self.fx.text("TOO EARLY", self.HERO_X + 8, GROUND - 34, RED)
+            self.app.audio.play("miss")
+
+    def parry_success(self):
+        a = self.app
+        self.wind = 0.0
+        self.en_atk = 0.0
+        self.double_left = 0
+        self.stun = 1.6
+        self.gauge = 0.0
+        self.stat["parry"] += 1
+        self.combo += 1
+        self.stat["maxcombo"] = max(self.stat["maxcombo"], self.combo)
+        self.score += 250
+        self.gain(4)
+        a.save.parry_done = True
+        hx = self.HERO_X + 8
+        self.fx.text("PARRY!", hx, GROUND - 38, CYAN, 2, 1.0)
+        self.fx.burst(hx + 8, GROUND - 8, CYAN, 18, 120)
+        a.audio.play("power")
+        a.shake(4, 0.2)
+        a.flash_screen(CYAN, 80, 0.18)
+        ex, ey = self.enemy_center()
+        dmg = 1 + 2 * self.pk("riposte")
+        self.hero_atk = 0.2
+        self.fx.shot(self.HERO_X + 14, GROUND - 10, ex - 6 * self.scale, ey, 560, CYAN,
+                     lambda: self.impact(dmg, True, False))
+
+    def finish_attack(self):
+        if self.double_left > 0 and self.phase == "play":
+            self.double_left = 0
+            self.begin_windup(True)
+            self.fx.text("DOUBLE!", self.enemy_center()[0], 36, RED, 1, 0.8)
+        else:
+            self.gauge = 0.12
+
     def hurt_hero(self):
         if self.phase != "play":
+            return
+        a = self.app
+        hx = self.HERO_X + 8
+        if self.ward:
+            self.ward = False
+            self.fx.text("WARD!", hx, GROUND - 34, CYAN, 2)
+            self.fx.burst(hx, GROUND - 8, CYAN, 12, 90)
+            a.audio.play("heal")
             return
         self.hearts -= 1
         self.stat["lost"] += 1
         self.combo = 0
         self.hero_hurt = 0.5
-        self.gauge = 0.12
-        hx = self.HERO_X + 8
         self.fx.burst(hx, GROUND - 8, RED, 14, 100)
         self.fx.text("-1", hx, GROUND - 32, RED, 2)
-        self.app.audio.play("hurt")
-        self.app.shake(5, 0.3)
-        self.app.flash_screen(RED, 100, 0.22)
+        a.audio.play("hurt")
+        a.shake(5, 0.3)
+        a.flash_screen(RED, 100, 0.22)
         if self.hearts <= 0:
-            self.begin_lose()
+            if self.revives > 0:
+                self.revives -= 1
+                self.hearts = 1
+                self.fx.text("SECOND WIND!", hx, GROUND - 46, GREEN, 1, 1.2)
+                a.audio.play("heal")
+            else:
+                self.begin_lose()
 
+    # ---- outcomes ---------------------------------------------------------
     def begin_win(self):
         self.phase, self.t = "win", -0.1
+        self.wind = self.en_atk = 0.0
         ex, ey = self.enemy_center()
         self.fx.burst(ex, ey, WHITE, 30, 160, 0.8)
         self.fx.burst(ex, ey, YELLOW, 20, 120, 0.8)
+        self.fx.burst(ex, ey, ORANGE, 10, 90, 1.0)
+        self.gain(8 + 2 * self.level + (40 if self.lv["boss"] else 0))
+        for _ in range(self.pk("vamp")):
+            self.heal()
         self.app.audio.play("ko")
         self.app.shake(6, 0.35)
 
     def begin_lose(self):
         self.phase, self.t = "lose", 0.0
-        self.en_atk = 0.0
+        self.en_atk = self.wind = 0.0
         self.app.audio.play("lose")
 
     def finish_win(self):
@@ -1821,32 +2229,51 @@ class BattleScene(Scene):
             lost = self.stat["lost"]
             stars = 3 if lost == 0 else (2 if lost <= 2 else 1)
             self.score += 500 + self.hearts * 100 + stars * 200
+            self.gain(stars * 5)
+            earned = self.bank()
             a.save.record_level(self.level, stars)
-            lines = [(f"SCORE {self.score}", WHITE), (f"BEST COMBO {self.stat['maxcombo']}", CYAN),
+            lines = [(f"SCORE {self.score}", WHITE),
+                     (f"COMBO {self.stat['maxcombo']}   PARRIES {self.stat['parry']}", CYAN),
                      (f"HEARTS LOST {lost}", GREEN if lost == 0 else RED),
-                     (f"LEVEL {self.level + 1} UNLOCKED", YELLOW)]
+                     (f"+{earned} COINS", YELLOW), (f"LEVEL {self.level + 1} UNLOCKED", GREEN)]
             opts = [((pygame.K_SPACE, pygame.K_RETURN), "SPACE", "NEXT LEVEL", lambda: self.go_level(self.level + 1)),
                     ((pygame.K_r,), "R", "RETRY", lambda: self.go_level(self.level)),
-                    ((pygame.K_ESCAPE,), "ESC", "LEVEL SELECT", lambda: a.pop(2))]
+                    (BACK_KEYS, "BKSP", "LEVEL SELECT", lambda: a.pop(2))]
             self.phase = "done"
             a.audio.play("win")
             a.push(Overlay(a, "BOSS DOWN!" if self.lv["boss"] else "LEVEL CLEAR!", GREEN, lines, opts, stars))
         else:
             self.score += 300 + self.level * 40 + (150 if self.stat["lost"] == 0 else 0)
+            earned = self.bank()
+            self.fx.text(f"+{earned} COINS", W // 2, 60, YELLOW, 1, 1.4)
             self.level += 1
             a.save.survival_wave = max(a.save.survival_wave, self.level - 1)
-            self.fx.text("WAVE CLEAR!", W // 2, 70, GREEN, 2, 1.2)
+            a.save.save()
             self.heal()
-            self.setup_enemy()
-            self.t = -0.4
+            self.phase = "perk"
+            a.audio.play("win")
+            a.push(PerkScene(a, self, roll_perks(self.perks)))
+
+    def after_perk(self, pid):
+        if pid:
+            self.perks[pid] = self.pk(pid) + 1
+            self.recompute()
+            if pid == "heart":
+                self.hearts += 1
+            elif pid == "wind":
+                self.revives += 1
+        self.setup_enemy()
+        self.t = -0.3
 
     def finish_lose(self):
         a = self.app
         self.phase = "done"
+        earned = self.bank(0.5)
         if self.mode == "campaign":
-            lines = [(f"ENEMY HP LEFT {self.hp}/{self.hp_max}", WHITE), (f"SCORE {self.score}", STEEL)]
+            lines = [(f"ENEMY HP LEFT {self.hp}/{self.hp_max}", WHITE), (f"SCORE {self.score}", STEEL),
+                     (f"+{earned} COINS", YELLOW)]
             opts = [((pygame.K_SPACE, pygame.K_RETURN, pygame.K_r), "SPACE", "TRY AGAIN", lambda: self.go_level(self.level)),
-                    ((pygame.K_ESCAPE,), "ESC", "LEVEL SELECT", lambda: a.pop(2))]
+                    (BACK_KEYS, "BKSP", "LEVEL SELECT", lambda: a.pop(2))]
             a.push(Overlay(a, "DEFEATED", RED, lines, opts))
         else:
             sv = a.save
@@ -1855,9 +2282,10 @@ class BattleScene(Scene):
             sv.survival_wave = max(sv.survival_wave, self.level)
             sv.save()
             lines = [(f"REACHED WAVE {self.level}", WHITE), (f"SCORE {self.score}", YELLOW),
+                     (f"COINS EARNED {self.run_coins}", YELLOW),
                      ("NEW HIGH SCORE!" if new_best else f"BEST {sv.survival_best}", GREEN if new_best else STEEL)]
             opts = [((pygame.K_SPACE, pygame.K_RETURN, pygame.K_r), "SPACE", "RUN AGAIN", self.restart),
-                    ((pygame.K_ESCAPE,), "ESC", "MENU", lambda: a.pop(2))]
+                    (BACK_KEYS, "BKSP", "MENU", lambda: a.pop(2))]
             a.push(Overlay(a, "GAME OVER", RED, lines, opts))
 
     def go_level(self, n):
@@ -1865,7 +2293,7 @@ class BattleScene(Scene):
         a.pop(2)
         a.push(BattleScene(a, "campaign", n))
 
-    # ---- update ----------------------------------------------------------
+    # ---- update -----------------------------------------------------------
     def update(self, dt):
         if self.hitstop > 0:
             self.hitstop -= dt
@@ -1884,19 +2312,40 @@ class BattleScene(Scene):
             if self.t >= self.INTRO_T:
                 self.phase = "play"
         elif self.phase == "play":
-            self.bar.update(dt)
-            if self.en_atk > 0:
-                self.en_atk -= dt
-                if not self.en_hit_done and self.en_atk <= 0.25:
-                    self.en_hit_done = True
-                    self.hurt_hero()
-            else:
-                self.gauge += dt / self.gauge_time
-                if self.gauge >= 1.0:
-                    self.gauge = 1.0
+            if self.stun > 0:                       # stunned: it can't act, you get bonus damage
+                self.stun -= dt
+                self.bar.update(dt)
+            elif self.wind > 0:                     # telegraph: bar frozen, parry now!
+                self.wind -= dt
+                if self.wind <= 0:
+                    self.wind = 0.0
                     self.en_atk = self.ATK_T
                     self.en_hit_done = False
-                    self.app.audio.play("rage")
+            elif self.en_atk > 0:                   # the lunge itself
+                self.en_atk -= dt
+                if not self.en_hit_done and self.en_atk <= 0.2:
+                    self.en_hit_done = True
+                    self.hurt_hero()
+                if self.en_atk <= 0 and self.phase == "play":
+                    self.en_atk = 0.0
+                    self.finish_attack()
+            else:
+                self.bar.update(dt)
+                rate = 1.0 / self.gauge_time
+                if "frenzy" in self.lv["abil"] and self.hp * 2 <= self.hp_max:
+                    rate *= 1.6
+                self.gauge += dt * rate
+                if "regen" in self.lv["abil"] and self.hp < self.hp_max:
+                    self.regen_t += dt
+                    if self.regen_t >= 6.0:
+                        self.regen_t = 0.0
+                        self.hp += 1
+                        ex, ey = self.enemy_center()
+                        self.fx.text("+1", ex, ey - 10 * self.scale - 8, GREEN, 1)
+                if self.gauge >= 1.0:
+                    self.gauge = 1.0
+                    self.double_left = 1 if self.lv["boss"] else 0
+                    self.begin_windup(False)
         elif self.phase == "win":
             self.t += dt
             if 0 < self.t < 0.7 and random.random() < 0.3:
@@ -1910,7 +2359,7 @@ class BattleScene(Scene):
             if self.t >= 1.7:
                 self.finish_lose()
 
-    # ---- drawing ---------------------------------------------------------
+    # ---- drawing ----------------------------------------------------------
     def draw_hero(self, s):
         x = self.HERO_X
         if self.hero_atk > 0:
@@ -1920,14 +2369,15 @@ class BattleScene(Scene):
         draw_shadow(s, x + 8, GROUND, 18)
         spr = hero_sprite(0)
         if self.phase == "lose" and self.t > 0.2:
-            img = pygame.transform.rotate(spr, -90)
-            blit_char(s, img, x, GROUND)
+            blit_char(s, pygame.transform.rotate(spr, -90), x, GROUND)
             return
         flash = WHITE if self.hero_hurt > 0 and int(self.hero_hurt * 30) % 2 == 0 else None
         bob = 1 if math.sin(self.clock_t * 5) > 0 else 0
         blit_char(s, spr, x, GROUND - bob, flash)
 
     def draw_enemy(self, s):
+        if self.phase == "perk":
+            return
         sz = 16 * self.scale
         left = self.ENEMY_CX - sz // 2
         feet = GROUND
@@ -1938,6 +2388,8 @@ class BattleScene(Scene):
         if self.en_atk > 0:
             p = 1 - self.en_atk / self.ATK_T
             left -= int(48 * math.sin(math.pi * min(1.0, p)))
+        if self.wind > 0:
+            left += 3 + int(math.sin(self.clock_t * 45) * 1.5)      # rearing back
         if self.en_hurt > 0:
             left += int(math.sin(self.clock_t * 70) * 2)
         if kind in ("bat", "ghost"):
@@ -1950,6 +2402,8 @@ class BattleScene(Scene):
         flash = None
         if self.en_hurt > 0.18:
             flash = WHITE
+        elif self.wind > 0 and int(self.clock_t * 14) % 2 == 0:
+            flash = RED
         elif self.phase == "play" and self.gauge > 0.8 and int(self.clock_t * 10) % 4 == 0:
             flash = RED
         if self.phase == "win":
@@ -1959,11 +2413,29 @@ class BattleScene(Scene):
                 return
             flash = WHITE
         blit_char(s, self.sprite, left, feet, flash, alpha)
+        if self.stun > 0:                                           # orbiting stars
+            ex, ey = self.enemy_center()
+            for k in range(3):
+                a = self.clock_t * 6 + k * 2.09
+                s.fill(YELLOW, (int(ex + math.cos(a) * 9 * self.scale), int(ey - 10 * self.scale - 4 + math.sin(a) * 3), 2, 2))
+
+    def draw_windup(self, s):
+        if self.wind <= 0:
+            return
+        cx, cy = self.HERO_X + 8, GROUND - 8
+        hot = self.wind <= self.pwin
+        r = 10 + int(26 * self.wind / self.wind_total)
+        pygame.draw.circle(s, WHITE if (hot and int(self.clock_t * 16) % 2 == 0) else STEEL, (cx, cy), 10, 1)
+        pygame.draw.circle(s, YELLOW if hot else RED, (cx, cy), r, 2 if hot else 1)
+        if hot:
+            draw_text(s, "NOW!", cx, cy - 30, YELLOW, 1, "center")
 
     def draw_hud(self, s):
         for i in range(self.max_hearts):
             s.blit(icon("heart", empty=i >= self.hearts), (6 + i * 10, 4))
         draw_text(s, f"{self.score:07d}", 7, 16, YELLOW)
+        s.blit(icon("coin"), (6, 25))
+        draw_text(s, str(int(self.coins_pending)), 18, 26, YELLOW)
         label = f"WAVE {self.level}" if self.mode == "survival" else f"LEVEL {self.level}"
         draw_text(s, label, W // 2, 4, WHITE, 1, "center")
         draw_text(s, self.lv["name"], W - 6, 4, RED if self.lv["boss"] else WHITE, 1, "right")
@@ -1971,14 +2443,23 @@ class BattleScene(Scene):
         for i in range(1, self.hp_max):
             x = W - 6 - 110 + (110 * i) // self.hp_max
             pygame.draw.rect(s, INK, (x, 14, 1, 7))
+        tags = [MOD_TEXT[a] for a in self.lv["abil"]]
+        if tags:
+            draw_text(s, ", ".join(tags), W - 6, 24, ORANGE, 1, "right")
         if self.combo >= 2:
             draw_text(s, f"COMBO x{self.combo}", W // 2, 15, ORANGE if self.combo >= 5 else WHITE, 1, "center")
+        if self.stun > 0:
+            draw_text(s, "STUNNED! +1 DMG", W // 2, 24, YELLOW, 1, "center")
         # rage meter below the enemy, key hint below the hero
         ex = self.ENEMY_CX
         hot = self.gauge > 0.8 and int(self.clock_t * 8) % 2 == 0
         bar_gauge(s, ex - 22, 160, 44, 5, self.gauge, RED if hot else ORANGE, CHAR, YELLOW)
         draw_text(s, "RAGE", ex, 167, RED if hot else STEEL, 1, "center")
         keycap(s, "SPACE", self.HERO_X + 8, 158)
+        if self.revives:
+            draw_text(s, f"REVIVE x{self.revives}", self.HERO_X + 8, 172, GREEN, 1, "center")
+        if self.ward:
+            draw_text(s, "WARD", self.HERO_X + 8, 148 - 28, CYAN, 1, "center")
 
     def draw_banner(self, s):
         if self.phase == "intro":
@@ -1989,13 +2470,21 @@ class BattleScene(Scene):
                 head = ("WAVE %d" if self.mode == "survival" else "LEVEL %d") % self.level
                 draw_text(s, head, W // 2, 65, YELLOW, 3, "center")
                 draw_text(s, ("BOSS: " if lv["boss"] else "") + lv["name"], W // 2, 92, RED if lv["boss"] else WHITE, 1, "center")
-                trait = ", ".join(MOD_TEXT[m] for m in lv["mods"]) or "NO TRICKS"
+                trait = ", ".join(MOD_TEXT[m] for m in lv["mods"] + lv["abil"]) or "NO TRICKS"
                 draw_text(s, trait, W // 2, 104, CYAN, 1, "center")
+                if lv["boss"]:
+                    draw_text(s, "ATTACKS TWICE!", W // 2, 114, RED, 1, "center")
             elif int(self.t * 10) % 2 == 0 or self.t > 1.5:
                 draw_text(s, "FIGHT!", W // 2, 68, ORANGE, 4, "center", INK)
-        elif self.phase == "play" and self.tutorial and self.stat["perfect"] + self.stat["good"] == 0:
-            if int(self.clock_t * 2) % 2 == 0:
-                draw_text(s, "PRESS SPACE WHEN THE LINE IS IN THE GREEN ZONE", W // 2, 140, WHITE, 1, "center")
+        elif self.phase == "play":
+            if self.wind > 0 and not self.app.save.parry_done:
+                if int(self.clock_t * 3) % 2 == 0:
+                    draw_text(s, "PRESS SPACE WHEN", 76, 96, WHITE, 1, "center")
+                    draw_text(s, "THE RING IS GOLD!", 76, 106, YELLOW, 1, "center")
+            elif self.tutorial and self.stat["perfect"] + self.stat["good"] == 0 and self.wind <= 0:
+                if int(self.clock_t * 2) % 2 == 0:
+                    draw_text(s, "PRESS SPACE WHEN", 76, 96, WHITE, 1, "center")
+                    draw_text(s, "THE LINE IS IN GREEN", 76, 106, GREEN, 1, "center")
         elif self.phase == "win" and self.t > 0.5:
             draw_text(s, "VICTORY!", W // 2, 68, YELLOW, 3, "center")
         elif self.phase == "lose" and self.t > 0.5:
@@ -2005,8 +2494,11 @@ class BattleScene(Scene):
         s.blit(self.bg, (0, 0))
         self.amb.draw(s, self.app.cfg["particles"])
         self.bar.draw(s)
+        if self.wind > 0 or self.en_atk > 0:
+            s.blit(self.bar_dim, (self.bar.x - 13, BAR_TOP - 5))
         self.draw_enemy(s)
         self.draw_hero(s)
+        self.draw_windup(s)
         self.fx.draw(s)
         self.draw_hud(s)
         self.draw_banner(s)
@@ -2170,7 +2662,7 @@ class VersusScene(Scene):
         w = 0 if self.wins[0] > self.wins[1] else 1
         lines = [(f"FINAL SCORE  {self.wins[0]} - {self.wins[1]}", WHITE)]
         opts = [((pygame.K_SPACE, pygame.K_RETURN, pygame.K_r), "SPACE", "REMATCH", self.restart),
-                ((pygame.K_ESCAPE,), "ESC", "MENU", lambda: a.pop(2))]
+                (BACK_KEYS, "BKSP", "MENU", lambda: a.pop(2))]
         a.audio.play("win")
         a.push(Overlay(a, f"P{w + 1} WINS!", BLUE if w == 0 else RED, lines, opts))
 
