@@ -29,6 +29,8 @@ F11 / Alt+Enter toggles fullscreen.  The window is resizable.
 </head>
 <body>
 <div id="wrap"><canvas id="screen" tabindex="0"></canvas></div>
+<!-- CrazyGames SDK (provides the Data module used for progress saving) -->
+<script src="https://sdk.crazygames.com/crazygames-sdk-v3.js"></script>
 <script>
 "use strict";
 /* ------------------------------------------------------------------ constants */
@@ -121,7 +123,7 @@ class Random {          // drop-in for python's random.Random(seed)
 }
 
 // ------------------------------------------------------------------ save data
-const SAVE_KEY = "timing_…json";
+const SAVE_KEY = "timing_clash_save.json";
 
 function _valid_hero(rows) {
   return (Array.isArray(rows) && rows.length === 16 &&
@@ -129,11 +131,27 @@ function _valid_hero(rows) {
                           [...r].every(c => c === "." || HEXCH.includes(c))));
 }
 
-function load_save() {
+// CrazyGames SDK Data module wrapper.  When the game runs on the CrazyGames
+// portal we use CrazyGames.init()/getData() plus the Data module for cloud
+// saves; when it doesn't (local file, other hosts) we fall back to localStorage
+// so progress still persists.
+const CG_SDK = (typeof window !== "undefined" && window.CrazyGames) ? window.CrazyGames : null;
+const CG_AVAILABLE = !!(CG_SDK && typeof CG_SDK.init === "function");
+
+let _saveCache = { highest: 1, coins: 0, best_score: 0, upgrades: {}, stars: {}, hero: null };
+
+async function load_save() {
   const data = { highest: 1, coins: 0, best_score: 0, upgrades: {}, stars: {}, hero: null };
-  let raw;
+  let raw = null;
   try {
-    raw = JSON.parse(localStorage.getItem(SAVE_KEY));
+    if (CG_AVAILABLE) {
+      await CG_SDK.init();
+      const sdkData = await CG_SDK.getData(SAVE_KEY);
+      if (sdkData !== undefined && sdkData !== null)
+        raw = (typeof sdkData === "string") ? JSON.parse(sdkData) : sdkData;
+    } else if (localStorage.getItem(SAVE_KEY)) {
+      raw = JSON.parse(localStorage.getItem(SAVE_KEY));
+    }
   } catch (err) { return data; }
   if (!raw || typeof raw !== "object") return data;
   try {
@@ -159,9 +177,18 @@ function load_save() {
 }
 
 function write_save(data) {
+  // keep an in-memory mirror so the running game always sees the latest state
+  _saveCache = data;
   try {
-    const out = Object.assign({}, data, { settings: Object.assign({}, SETTINGS) });
-    localStorage.setItem(SAVE_KEY, JSON.stringify(out));
+    const out = JSON.stringify(Object.assign({}, data, { settings: Object.assign({}, SETTINGS) }));
+    if (CG_AVAILABLE && CG_SDK.Data) {
+      // queue the save blob into the SDK Data module and push it to the cloud
+      CG_SDK.Data.setData({ [SAVE_KEY]: out });
+      const p = CG_SDK.Data.saveData();
+      if (p && p.catch) p.catch(() => {});
+    } else {
+      localStorage.setItem(SAVE_KEY, out);
+    }
   } catch (err) { /* storage unavailable */ }
 }
 
@@ -2230,7 +2257,15 @@ class Game {
     this.window.width = W * START_SCALE;
     this.window.height = H * START_SCALE;
     this.resize();
-    this.save = load_save();
+    this.save = _saveCache;
+    // pull real progress from the CrazyGames Data module (or localStorage
+    // fallback) asynchronously, then rebuild assets/settings once it lands
+    load_save().then(save => {
+      this.save = save;
+      _saveCache = save;
+      this.assets.set_hero(save.hero);
+      this.run_hp = this.max_hearts();
+    });
     this.assets = new Assets(this.save.hero);
     this.audio = new Audio();
     this.run_hp = this.max_hearts();
